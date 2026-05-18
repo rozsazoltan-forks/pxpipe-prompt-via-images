@@ -55,9 +55,16 @@ interface Totals {
   startedAt: number;
 }
 
-/** Tokens-per-image estimate. Anthropic charges ~ceil((W*H)/750) for image
- *  blocks. Our renderer caps at 1466×1568 ≈ 3066 tokens per image. */
-const IMAGE_TOKEN_ESTIMATE = 3066;
+/** Per-pixel cost in tokens. Anthropic charges (W*H)/750 for image blocks.
+ *  For grayscale PNG of text, the encoded byte count is roughly 50% of the
+ *  raw pixel count (zlib on dense glyph data), so:
+ *     raw_pixels ≈ png_bytes × 2
+ *     token_est  ≈ raw_pixels / 750  ≈ png_bytes / 375
+ *  This tracks ACTUAL rendered size per request instead of assuming every
+ *  image is the worst-case 1466×1568. */
+function estImageTokens(pngBytes: number): number {
+  return Math.floor(pngBytes / 375);
+}
 
 /** Compute the weighted "effective" input cost of a single upstream call.
  *  Matches Python's formula: input + cache_create*1.25 + cache_read*0.10.
@@ -74,16 +81,23 @@ function effectiveCost(
 /** Estimate what the call WOULD have cost if we hadn't compressed. Adds back
  *  the text tokens we removed (minus the image tokens we added) at the SAME
  *  cache mix the actual call paid — otherwise cold-cache turns get scored as
- *  if the baseline were warm-cache and savings look tiny. */
+ *  if the baseline were warm-cache and savings look tiny.
+ *
+ *  Uses `imageBytes` (actual PNG byte count) to estimate image tokens rather
+ *  than `imageCount × 3066`. The old worst-case estimate assumed every image
+ *  was 1466×1568, which our renderer never produces — typical images at this
+ *  workload are ~1466×90px, so the worst-case overestimates by ~15× and the
+ *  `extraText` clamp collapses to 0, hiding real savings.
+ */
 function baselineCost(
   actualEff: number,
   origChars: number,
-  imageCount: number,
+  imageBytes: number,
   cacheCreate: number,
   cacheRead: number,
 ): number {
   const txtReplaced = Math.floor(origChars / 4); // ~4 chars per token in English
-  const imgTokensEst = imageCount * IMAGE_TOKEN_ESTIMATE;
+  const imgTokensEst = estImageTokens(imageBytes);
   const extraText = Math.max(0, txtReplaced - imgTokensEst);
   const cachedTotal = cacheCreate + cacheRead;
   const baselineRate =
@@ -138,7 +152,7 @@ export class DashboardState {
     const eff = haveUsage ? effectiveCost(inp, cc, cr) : 0;
     const baselineEff =
       haveUsage && compressed
-        ? baselineCost(eff, info?.origChars ?? 0, info?.imageCount ?? 0, cc, cr)
+        ? baselineCost(eff, info?.origChars ?? 0, info?.imageBytes ?? 0, cc, cr)
         : eff;
 
     const prevSaved = this.totals.effectiveInputBaselineEst - this.totals.effectiveInputActual;
@@ -155,7 +169,7 @@ export class DashboardState {
       status: ev.status,
       compressed,
       cc_added: compressed ? 1 : undefined, // we always emit exactly one cache_control
-      expected_image_tokens: compressed ? (info?.imageCount ?? 0) * IMAGE_TOKEN_ESTIMATE : undefined,
+      expected_image_tokens: compressed ? estImageTokens(info?.imageBytes ?? 0) : undefined,
       input_tokens: haveUsage ? inp : undefined,
       cache_create: haveUsage ? cc : undefined,
       cache_read: haveUsage ? cr : undefined,
@@ -199,7 +213,7 @@ export class DashboardState {
         compressed: t.compressed === true,
         cc_added: t.compressed === true ? 1 : undefined,
         expected_image_tokens:
-          t.compressed === true ? (t.image_count ?? 0) * IMAGE_TOKEN_ESTIMATE : undefined,
+          t.compressed === true ? estImageTokens(t.image_bytes ?? 0) : undefined,
         input_tokens: t.input_tokens,
         cache_create: t.cache_create_tokens,
         cache_read: t.cache_read_tokens,
