@@ -65,6 +65,32 @@ function cellsFor(codepoint: number): number {
  *  4-space-tab-stop oriented. */
 const TAB_WIDTH = 4;
 
+/** Conservative whitespace minify pass run BEFORE tab-expand + wrap.
+ *
+ *  Two rules, deliberately limited so we never alter content semantics:
+ *    1. Strip trailing whitespace (spaces + tabs) on every line. Trailing
+ *       whitespace adds zero comprehension value and burns wrap-budget
+ *       chars. Common in editor-saved files + auto-generated logs.
+ *    2. Collapse runs of 4+ consecutive `\n` (= 3+ blank lines) down to
+ *       3 `\n` (= 2 blank lines). Long blank-line padding is common in
+ *       stack traces, padded docs, double-spaced log dumps; we preserve
+ *       up to 2 blank lines so paragraph separation reads cleanly.
+ *
+ *  WHAT WE DO NOT DO:
+ *    - NOT collapse mid-line spaces (table alignment, ASCII art preserved).
+ *    - NOT collapse leading whitespace (indentation IS structure).
+ *    - NOT mutate non-whitespace.
+ *
+ *  Target win per HANDOFF R1: ~1.5–2× more chars per rendered image on
+ *  typical short-line workloads. See post-implementation measurement. */
+export function minifyForRender(text: string): string {
+  return text
+    .split('\n')
+    .map((line) => line.replace(/[ \t]+$/, ''))
+    .join('\n')
+    .replace(/\n{4,}/g, '\n\n\n'); // 4+ \n → 3 \n (= 2 blank lines)
+}
+
 /** Expand `\t` in a single line to a visible `→` (U+2192) glyph + padding
  *  spaces to the next `TAB_WIDTH` tab stop. Honors visual columns: wide
  *  chars (CJK) count as 2 columns so tab alignment after `中\tx` lands
@@ -106,11 +132,16 @@ export function expandTabsInLine(line: string): string {
  *  character-count behavior for pure-ASCII input — guarantees the
  *  determinism test stays byte-identical.
  *
- *  Also expands tabs to spaces (4-stop) on each line so tab characters
- *  don't fall through to the blit loop as dropped glyphs. */
+ *  Pipeline order (per HANDOFF R1):
+ *    1. minifyForRender: strip trailing whitespace, collapse 4+ \n → 3 \n
+ *    2. expandTabsInLine: \t → '→' + padding to next 4-stop
+ *    3. soft-wrap by visual column budget (this loop)
+ *  Minify runs first so trailing tabs get stripped before they'd
+ *  needlessly expand to arrow + spaces. */
 function wrapLines(text: string, cols: number): string[] {
   const out: string[] = [];
-  for (const rawWithTabs of text.split('\n')) {
+  const minified = minifyForRender(text);
+  for (const rawWithTabs of minified.split('\n')) {
     const raw = expandTabsInLine(rawWithTabs);
     if (raw.length === 0) {
       out.push('');

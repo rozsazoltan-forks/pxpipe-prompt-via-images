@@ -3,6 +3,7 @@ import {
   renderChunkToPng,
   renderTextToPngs,
   expandTabsInLine,
+  minifyForRender,
 } from '../src/core/render.js';
 import { encodeGrayPng, bytesToBase64 } from '../src/core/png.js';
 import { transformRequest } from '../src/core/transform.js';
@@ -206,6 +207,74 @@ describe('renderer', () => {
     expect(img.droppedChars).toBe(3);
     expect(img.droppedCodepoints.size).toBe(1);
     expect(img.droppedCodepoints.get(0x1f600)).toBe(3);
+  });
+
+  // --- Whitespace minify (HANDOFF R1) ---------------------------------------
+  // Conservative whitespace cleanup before tab-expand + wrap. Strip trailing
+  // whitespace per line; collapse 4+ \n runs down to 3 \n (max 2 blank lines).
+  // Mid-line spaces and leading indent are NEVER touched (alignment + structure
+  // are preserved).
+
+  it('minifyForRender: strips trailing spaces', () => {
+    expect(minifyForRender('foo   \n')).toBe('foo\n');
+  });
+
+  it('minifyForRender: strips trailing tab + space mix', () => {
+    expect(minifyForRender('foo\t \n')).toBe('foo\n');
+  });
+
+  it('minifyForRender: collapses 5 newlines to 3 (= 2 blank lines)', () => {
+    expect(minifyForRender('foo\n\n\n\n\nbar')).toBe('foo\n\n\nbar');
+  });
+
+  it('minifyForRender: preserves 2 newlines (= 1 blank line)', () => {
+    expect(minifyForRender('foo\n\nbar')).toBe('foo\n\nbar');
+  });
+
+  it('minifyForRender: preserves 3 newlines (= 2 blank lines, the cap)', () => {
+    expect(minifyForRender('foo\n\n\nbar')).toBe('foo\n\n\nbar');
+  });
+
+  it('minifyForRender: NEVER collapses mid-line spaces (alignment preserved)', () => {
+    expect(minifyForRender('a   b   c')).toBe('a   b   c');
+  });
+
+  it('minifyForRender: NEVER strips leading whitespace (indent preserved)', () => {
+    expect(minifyForRender('    foo')).toBe('    foo');
+  });
+
+  it('minifyForRender: real-world mix of trailing whitespace + blank runs', () => {
+    // Stack-trace shaped: lines with trailing spaces + 5-line blank gaps.
+    const input = 'Error: x failed   \n\tat foo()  \n\n\n\n\n\tat bar()\n';
+    const expected = 'Error: x failed\n\tat foo()\n\n\n\tat bar()\n';
+    expect(minifyForRender(input)).toBe(expected);
+  });
+
+  it('minify pipeline integration: trailing whitespace + blank runs → shorter image', async () => {
+    // Same content, with-vs-without whitespace bloat. The "bloated" version
+    // has trailing spaces and 6-line blank gaps; the "clean" version has
+    // neither. Both render to single-PNG output for the test; we measure
+    // the height delta and confirm the bloated→minified reduction is real.
+    const cleanLines = ['line one', 'line two', '', '', 'line three', 'line four'];
+    const bloatedLines = [
+      'line one     ', // trailing whitespace
+      'line two   ',
+      '',
+      '',
+      '',
+      '',
+      '',
+      '',
+      '',
+      'line three  ',
+      'line four ',
+    ];
+    const cleanImg = await renderChunkToPng(cleanLines.join('\n'));
+    const bloatedImg = await renderChunkToPng(bloatedLines.join('\n'));
+    // After minify, both should render to the same final shape.
+    expect(bloatedImg.height).toBe(cleanImg.height);
+    expect(bloatedImg.droppedChars).toBe(0);
+    expect(cleanImg.droppedChars).toBe(0);
   });
 
   // --- Tab expansion (production bug fix) -----------------------------------
