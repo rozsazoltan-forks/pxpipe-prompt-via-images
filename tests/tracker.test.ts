@@ -65,6 +65,62 @@ describe('toTrackEvent', () => {
     expect(out.ts).toMatch(/^\d{4}-\d{2}-\d{2}T/);
   });
 
+  it('captures the nested cache_creation split and server_tool_use counters', () => {
+    // Anthropic's `usage` block carries some fields inline and others nested
+    // under `cache_creation` / `server_tool_use`. The flat 4-field view we
+    // historically copied silently dropped 3 real billing dimensions:
+    //   - output_tokens (rate-multiplier ×5 — see dashboard math)
+    //   - cache_creation.ephemeral_5m_input_tokens (1.25× rate)
+    //   - cache_creation.ephemeral_1h_input_tokens (2× rate — meaningful $)
+    //   - server_tool_use.web_search_requests (billed per request, not token)
+    // Regression guard for the May-2026 audit that surfaced the gap.
+    const out = toTrackEvent({
+      method: 'POST',
+      path: '/v1/messages',
+      status: 200,
+      durationMs: 100,
+      usage: {
+        input_tokens: 10,
+        output_tokens: 250,
+        cache_creation_input_tokens: 1000,
+        cache_read_input_tokens: 50,
+        cache_creation: {
+          ephemeral_5m_input_tokens: 900,
+          ephemeral_1h_input_tokens: 100,
+        },
+        server_tool_use: {
+          web_search_requests: 3,
+        },
+      },
+    });
+    expect(out.output_tokens).toBe(250);
+    expect(out.cache_create_tokens).toBe(1000);
+    expect(out.cache_create_5m_tokens).toBe(900);
+    expect(out.cache_create_1h_tokens).toBe(100);
+    expect(out.web_search_requests).toBe(3);
+  });
+
+  it('omits the nested usage fields when Anthropic does not return them', () => {
+    // Older API versions and non-cache requests return only the flat
+    // fields. The optional copies must stay undefined, not zero — zero is
+    // a real value that means "we measured it and it was zero".
+    const out = toTrackEvent({
+      method: 'POST',
+      path: '/v1/messages',
+      status: 200,
+      durationMs: 100,
+      usage: {
+        input_tokens: 10,
+        output_tokens: 5,
+        cache_creation_input_tokens: 0,
+        cache_read_input_tokens: 0,
+      },
+    });
+    expect(out.cache_creation_5m_tokens).toBeUndefined();
+    expect(out.cache_creation_1h_tokens).toBeUndefined();
+    expect(out.web_search_requests).toBeUndefined();
+  });
+
   it('handles a minimal ProxyEvent (no info, no usage) without throwing', () => {
     const out = toTrackEvent({
       method: 'GET',

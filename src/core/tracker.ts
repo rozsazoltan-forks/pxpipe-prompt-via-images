@@ -105,6 +105,12 @@ export interface TrackEvent {
   output_tokens?: number;
   cache_create_tokens?: number;
   cache_read_tokens?: number;
+  /** Cache_create split by tier — 1.25x (5-min) and 2x (1-hour) input rates.
+   *  Their sum equals `cache_create_tokens` when both fields are present. */
+  cache_create_5m_tokens?: number;
+  cache_create_1h_tokens?: number;
+  /** Server-side web search calls billed per-request (not per-token). */
+  web_search_requests?: number;
 
   /** Ground-truth pre-compression token count from a parallel call to
    *  /v1/messages/count_tokens on the ORIGINAL request body. The endpoint
@@ -263,6 +269,19 @@ export function toTrackEvent(ev: ProxyEvent): TrackEvent {
       out.cache_create_tokens = u.cache_creation_input_tokens;
     if (u.cache_read_input_tokens !== undefined)
       out.cache_read_tokens = u.cache_read_input_tokens;
+    // Anthropic returns a nested `cache_creation` block that splits the
+    // `cache_creation_input_tokens` total across the 5-min (1.25x rate) and
+    // 1-hour (2x rate) ephemeral tiers. Useful for honest cost math when the
+    // session ever opts into the 1h cache class.
+    if (u.cache_creation) {
+      if (u.cache_creation.ephemeral_5m_input_tokens !== undefined)
+        out.cache_create_5m_tokens = u.cache_creation.ephemeral_5m_input_tokens;
+      if (u.cache_creation.ephemeral_1h_input_tokens !== undefined)
+        out.cache_create_1h_tokens = u.cache_creation.ephemeral_1h_input_tokens;
+    }
+    // Server-side tools (e.g. web_search) bill per-request, not per-token.
+    if (u.server_tool_use?.web_search_requests !== undefined)
+      out.web_search_requests = u.server_tool_use.web_search_requests;
   }
   return out;
 }

@@ -21,3 +21,7 @@ package-lock.json
 __pycache__/
 *.pyc
 *.pyo
+
+# Scratch diagrams from drawmode MCP — exploration artifacts, not part of the repo
+*.drawmode.ts
+*.excalidraw
