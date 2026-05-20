@@ -246,6 +246,98 @@ the model and atlas evolve.
 
 ---
 
+## How history compression works
+
+This is `Variant C` in `src/core/transform.ts` (the `collapseHistory`
+path). It addresses a different cache cliff than the static slab.
+
+### The problem it solves
+
+Claude Code uses 4 prompt-cache breakpoints. The static slab (system +
+tools + `CLAUDE.md`) holds one. The remaining 3 live the conversation
+tail. In a long session:
+
+```
+[system slab][turn 1][turn 2]...[turn 50][turn 51 live]
+              ↑                    ↑
+              cache breakpoint     cache breakpoint
+              from 40 turns ago    on current turn
+```
+
+When the gap between the oldest cached breakpoint and the live tail
+exceeds the **4-breakpoint cache budget**, every new turn page-faults
+the historical prefix and Anthropic re-bills the whole `tool_result`
+river at 1.25× `cache_create`. A 50-turn session with 30 turns of
+fat `tool_result` blocks (file reads, bash outputs, MCP responses) can
+pay **~600k tokens of uncached, repeat-billed text every turn**.
+
+### The collapse
+
+`collapseHistory()` walks from oldest message forward looking for the
+**closed prefix** — the longest run of turns that's *guaranteed* never
+to change again (no open `tool_use` waiting for a result, ends on a
+clean `user`/`assistant` boundary). It serialises that whole run into
+one giant block of text and feeds it to the same `renderTextToPngs`
+pipeline the slab uses.
+
+Output looks like:
+
+```
+[system slab]
+[synthetic user message 1: "[Earlier in this conversation:]"
+  └ image block: PNG of 175 turns serialised as JSON
+  └ text block: "[End of earlier context.]"]
+[turn 48 (last 2 turns kept verbatim in "Live tail")]
+[turn 49]
+[turn 50 live]
+```
+
+`keepTail: 4` is the default — the 4 most recent turns stay as native
+messages so the model still has structured access to recent
+`tool_use`/`tool_result` pairs.
+
+### Why it's tricky
+
+Three honesty gates have to all clear:
+
+1. **`historyReason: 'no_history'`** — only one message, nothing to
+   collapse.
+2. **`'prefix_too_short'`** — the closed prefix is under
+   `minCollapsePrefix: 10` turns.
+3. **`'no_closed_prefix'`** — every prefix ends on an open `tool_use`
+   (mid-call). Common in single-turn smoke tests.
+4. **`'not_profitable'`** — the gate (`isCompressionProfitable`)
+   decided the text was so sparse the image cost would exceed the text
+   cost. This is the one that was firing wrong before today's
+   `e8545a9` commit.
+5. **`'collapsed'`** — actually fired.
+
+### Today's fix (the `42ef4c5` commit)
+
+History was using `charsPerToken: 4` (Anthropic's English-prose
+default). Real chat-shaped JSONL (`[{role: 'user', content:
+[{type: 'tool_result', content: '...'}]}]`) tokenizes denser than
+prose. The N=10 rejected history events in `events.jsonl` had real cpt
+1.08–1.10 — every one of them was a profitable compression the gate
+dropped on the floor.
+
+Fixed by wiring `HISTORY_CHARS_PER_TOKEN = 2.5` at the call site (same
+shape as the slab's `SLAB_CHARS_PER_TOKEN = 2.5` fix from `e8545a9`
+earlier today). Live data after restart shows it firing: the 12:30:01
+event in `events.jsonl` has `historyReason: 'collapsed'`,
+`collapsed_turns: 175`, `collapsed_chars: 180,684`.
+
+### Where to find it in code
+
+- **Decision:** `transform.ts:1670` — the `historyProfitable` predicate
+- **Walking the closed prefix:** `core/history.ts:findClosedPrefixBoundary`
+- **Serialising turns to text:** `core/history.ts` (`messagesToText` /
+  `blocksToText`)
+- **Constants:** `transform.ts:175` (`HISTORY_CHARS_PER_TOKEN`,
+  `HISTORY_DEFAULTS`)
+
+---
+
 ## Quick start (Node)
 
 ```bash
