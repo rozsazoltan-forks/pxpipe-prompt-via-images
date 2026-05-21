@@ -264,7 +264,40 @@ extrapolation margin on top of 2× = 5500 also doubles), and a global
 `multiCol: 2` default that can be overridden to 1 if OCR ordering ever
 turns out wrong on a specific deployment.
 
-**Telemetry is the only honest oracle.** Every constant in the gate —
+**Cache prefix invalidation is asymmetric in time.** Anthropic matches
+prompt cache by *byte prefix*, so any change to the request changes what
+caches downstream of that change. The first turn we replace a chunk of
+message history with a PNG, the prior text-based prefix becomes wasted
+bytes from Anthropic's POV — cache flushes from the change-point onward
+and we pay `cache_create` (1.25×) on the new image. Subsequent turns
+with the same image bytes get `cache_read` (0.1×) on the image. So
+history compression is **multi-turn economics**: a single-turn break-even
+gate that asks *"is image_tokens < text_tokens cold?"* always says no
+once Anthropic has already cached the text — text-at-10% beats
+image-at-40%. But that reasoning ignores that *the text cache will
+expire / get evicted / hit the 4-breakpoint cliff anyway*, and when it
+does, the next cold call pays full freight on the giant text prefix.
+The honest framing is **expected lifetime cost** of the prefix in this
+session vs. **expected lifetime cost** if we collapse now. Neither
+number is locally observable. The same shape of problem shows up in
+database indexes (cost of building amortizes over future queries), JIT
+compilation (interpret first, compile what proves hot), and ZFS block
+compression (compress speculatively, keep only if it shrinks ≥ a
+threshold). Pixelpipe today uses a per-turn `chars/token` gate — the
+JIT analogue is "always interpret." We have data on individual turns
+but no session-scoped amortization model yet, which is why history
+collapse declines as `not_profitable` on warm Codex traffic even when
+the long-run answer would be "collapse and let `cache_read` recoup it."
+The next iteration is the ZFS-style **try-then-decide** path:
+render, count rendered tokens against a parallel `count_tokens` probe
+on the pre-collapse text, commit the collapse only if the difference
+exceeds a multi-turn break-even (e.g. image_tokens × (1+0.1·N) <
+text_tokens × (1+0.1·N) for N ≥ a configured amortization horizon).
+Honest, local, deterministic, no session-state required — at the cost
+of ~30 ms of wasted render CPU on turns we end up discarding. Worth it
+to stop guessing.
+
+****Telemetry is the only honest oracle.** Every constant in the gate —
 `SLAB_CHARS_PER_TOKEN`, `HISTORY_CHARS_PER_TOKEN`, `LINES_PER_IMAGE`,
 `TOKENS_PER_IMAGE_SINGLE_COL`, `effectiveTokensPerImage(numCols)` — has
 a comment pointing at the production probe that grounded it, with date
@@ -359,6 +392,136 @@ shape as the slab's `SLAB_CHARS_PER_TOKEN = 2.5` fix from `e8545a9`
 earlier today). Live data after restart shows it firing: the 12:30:01
 event in `events.jsonl` has `historyReason: 'collapsed'`,
 `collapsed_turns: 175`, `collapsed_chars: 180,684`.
+
+### The unsolved part: multi-turn amortization
+
+The break-even gate above (`isCompressionProfitable`) is **per-turn** —
+it asks *"on this single request, is the image cheaper than the text?"*
+That question has a clean answer when both sides are cold (no
+prompt-cache hits), but it has the wrong answer when Anthropic has
+already cached the prior text-based prefix:
+
+| state | text cost | image cost | per-turn winner |
+|---|---|---|---|
+| cold (turn 1, fresh session) | 1.00× | 0.40× of text-token-count | image |
+| warm with cached text prefix | 0.10× | 0.40× cold → 0.10× after | **text** |
+| cache expired (5-min idle / 4-bp eviction) | 1.00× again | re-cached image hits at 0.10× | **image** |
+
+A pure per-turn gate happily collapses on cold and correctly refuses on
+warm — but it can't see that a warm session will eventually go cold
+again, and on that cold turn the giant text prefix pays full freight
+while the image prefix pays once and then rides cache for the rest of
+the session.
+
+This is the same shape of decision a JIT compiler makes (interpret first
+turns, compile what proves hot), a DB optimiser makes (build the index
+if N future queries amortize the scan), or ZFS makes (compress the block,
+keep the compressed form if it shrinks by ≥ 12.5%). None of them rely
+on knowing N exactly. They all rely on a **bounded amortization
+horizon** baked into the gate: assume N=K turns, decide once, eat the
+loss if K turned out to be smaller.
+
+Pixelpipe today is the "always interpret" mode. The design space for
+fixing it has four credible options. Documenting all of them — including
+the ones we rejected — so the next contributor doesn't reinvent the
+analysis.
+
+#### Option A — Try-then-decide (ZFS block-compression analogue)
+
+Render the closed-prefix history to PNG(s) speculatively, count actual
+image tokens via a parallel `count_tokens` probe, compare against text
+tokens for the same prefix evaluated at a fixed amortization horizon
+(e.g. `N=5` future turns, accept iff
+`image_tokens × (1 + 0.1·(N-1)) < text_tokens × (1 + 0.1·(N-1))`).
+Commit the image only if it wins; discard the render otherwise — ~30 ms
+of wasted CPU on the daemon, no token cost.
+
+- **Pro:** local, deterministic, no session state, no future-knowledge
+  assumption. Honest about the horizon and accepts bounded waste on
+  misjudgments. Composes with all the other gates we already have.
+- **Con:** one extra `count_tokens` round-trip per request that's
+  considering collapse. Wasted render CPU on rejects (~30 ms each at
+  current image counts).
+- **Status:** chosen path. Specced; not yet implemented.
+
+#### Option B — Session-state aware (JIT tiered-compilation analogue)
+
+Derive a session id from request shape (e.g. hash of the first user
+message + system slab), track per-session `{turn_count, cache_state,
+last_render_decision}` in the host, leave history as text for turns
+`1..K`, collapse once `K` is exceeded. ocproxy already has
+`cache_session_hash` which can stand in as the session id.
+
+- **Pro:** matches the JIT pattern exactly — interpret first, compile
+  what proves hot. Avoids speculative render cost on short-lived
+  sessions. Cleanest economics on long sessions.
+- **Con:** introduces durable state. State means schema, eviction,
+  migration. State means "why is pixelpipe behaving differently on
+  identical inputs?" debugging. Cross-process / cross-host coordination
+  if the daemon restarts or fans out. The honesty cost is high relative
+  to the marginal win over Option A.
+- **Status:** rejected for v1 of the fix. Revisit if Option A leaves
+  measurable money on the table after a few weeks of data.
+
+#### Option C — Always collapse, trust the law of large numbers (CDN analogue)
+
+Drop the break-even check entirely for history; collapse always when
+prefix ≥ `minCollapsePrefix` turns. Trust that amortization wins on
+average across many sessions. Measure for a week; if average savings go
+negative, raise the gate.
+
+- **Pro:** simplest code change. Fastest to ship. Generates the most
+  data fastest because every eligible request collapses.
+- **Con:** dishonest about per-request economics. On warm-cache-heavy
+  workloads (which is what production Codex traffic actually looks
+  like) this loses money on a non-trivial fraction of requests. "It
+  averages out" is true in expectation but bad UX when the user's
+  specific session is the one that pays the tax.
+- **Status:** considered as a measurement-only experiment. Rejected as
+  a default because pixelpipe's reputation is honesty per-request, not
+  per-quarter.
+
+#### Option D — Cache-bust-driven (event-driven analogue)
+
+Watch incoming requests for the signal that the static-slab cache just
+flushed (e.g. `cache_created_tokens > 0` on a turn where the slab sha
+didn't change → 4-breakpoint cliff or 5-min idle eviction). On that
+turn the next call will pay full freight on the entire prefix anyway,
+so collapse aggressively. On subsequent warm turns, leave the prefix as
+text.
+
+- **Pro:** maximally honest — only collapses when the host has visible
+  evidence the text path is about to lose. Smallest possible waste.
+- **Con:** requires session state (same con as B) plus prior-turn
+  observation. The signal arrives one turn late: by the time we see
+  `cache_created`, the current turn already paid the cold tax. Best we
+  can do is amortize on the *next* cold turn, which may be 5 minutes
+  away or never (user closes session).
+- **Status:** rejected for v1. The signal arrives too late to drive the
+  current turn's decision. Possibly a useful telemetry signal regardless
+  — knowing *when* the cache flushed is interesting even if we don't
+  act on it.
+
+#### Why Option A wins
+
+The decision criteria were, in order:
+
+1. **No session state.** Pixelpipe is stateless by design — the same
+   request bytes always produce the same response bytes. State is what
+   turns a library into a service.
+2. **No flag.** Decisions belong inside the proxy, not on the operator.
+3. **Per-request honesty.** A request should not pay a tax on the
+   assumption that other requests will recoup it.
+4. **Local data only.** Don't need to observe the future, don't need to
+   remember the past.
+
+Option A clears all four. B and D fail (1). C fails (3). A's only cost
+is the speculative render CPU on rejects, which is bounded and
+measurable.
+
+Why we haven't shipped it yet: needs a `count_tokens` probe wired
+through the renderer's output and a host-supplied amortization-horizon
+constant. Specced; not implemented.
 
 ### Where to find it in code
 
