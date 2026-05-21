@@ -156,12 +156,20 @@ Rates from [Anthropic's pricing page](https://www.anthropic.com/pricing)
 for Opus 4.7 (input pricing has been flat across 4.5/4.6/4.7). Image
 tokens are billed at the input rate.
 
-| line item            | rate           |
-| -------------------- | -------------- |
-| input                | $2.50 / MTok   |
-| output               | $12.50 / MTok  |
-| cache_create (5 min) | $3.125 / MTok  |
-| cache_read           | $0.25 / MTok   |
+| line item            | rate          |
+| -------------------- | ------------- |
+| input                | $5.00 / MTok  |
+| output               | $25.00 / MTok |
+| cache_create (5 min) | $6.25 / MTok  |
+| cache_read           | $0.50 / MTok  |
+
+> Opus 4.7 uses a different tokenizer than 4.5 / 4.6 (per
+> [Anthropic's pricing page](https://docs.claude.com/en/docs/about-claude/pricing)).
+> The same input string does not produce the same token count across
+> models, so any hardcoded image-token / chars-per-token constants in
+> pixelpipe were tuned on an earlier tokenizer and may be biased on
+> 4.7. The break-even gate's only honest oracle is `count_tokens`
+> against the actual target model.
 
 ### Worked example — one real cold-miss event
 

@@ -178,15 +178,24 @@ interface Totals {
 const OUTPUT_TOKEN_RATE = 5.0;
 
 /** Per-million-token input rate ASSUMED for the headline dollar figure.
- *  Source: [docs-pricing] — Claude Opus 4.7 base input is $2.50/Mtok.
+ *  Source: https://docs.claude.com/en/docs/about-claude/pricing — Opus 4.7
+ *  input is $5/Mtok (same as Opus 4.5 / 4.6; the previous "$2.50" value
+ *  here was a regression). Cache-write 5m = $6.25/Mtok (1.25×),
+ *  cache-read = $0.50/Mtok (0.10×).
  *
  *  This is exposed on /proxy-stats as `pricing_assumptions.input_per_mtok`
  *  so the operator can see what we assumed and override if they're
  *  running against a non-default deployment (Bedrock/Vertex add a 10%
- *  premium per [docs-pricing], Sonnet would be $3/Mtok, etc.). The
- *  previous value here was $5/Mtok — that was Opus 4.5/4.6 pricing and over-
- *  stated dollar savings by 2× on Opus 4.7. */
-const ASSUMED_INPUT_USD_PER_MTOK = 2.5;
+ *  premium; Sonnet would be $3/Mtok, etc.).
+ *
+ *  NOTE: Opus 4.7 uses a different tokenizer than 4.5/4.6 (per
+ *  docs.claude.com/en/docs/about-claude/pricing), so even at the same
+ *  $/Mtok rate, the same string maps to a different token count. The
+ *  honest oracle for "tokens in this body" is `count_tokens` against the
+ *  actual target model; do not trust hardcoded chars-per-token or
+ *  tokens-per-image constants on 4.7 without verifying against the
+ *  upstream probe. */
+const ASSUMED_INPUT_USD_PER_MTOK = 5.0;
 
 export class DashboardState {
   private recent: RecentRow[] = [];
@@ -818,7 +827,7 @@ const DASHBOARD_HTML = `<!doctype html>
   </div>
   <div class="card"><div class="label">$ saved</div>
     <div class="value pos" id="m_usd">$0.00</div>
-    <div class="small" id="m_usd_sub">at $2.50/M input tokens (Opus 4.7)</div>
+    <div class="small" id="m_usd_sub">at $5/M input tokens (Opus 4.7)</div>
     <details class="math"><summary>show calculation</summary>
       <div class="formula" id="m_usd_math"></div>
     </details>
