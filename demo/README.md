@@ -1,50 +1,17 @@
-# pxpipe smart-zone demo
+# pxpipe demos
 
-**Shows that pxpipe keeps Claude *sharp* at large context.** Same task, two
-columns: the plain column drowns in a huge context and gets the answer wrong
-(the "dumb zone"); the pxpipe column images the bulk, keeps a small active
-context, and answers correctly.
+Two demos, two questions, two honest verdicts.
 
-Both columns must be **Fable 5** (pxpipe only compresses `claude-fable-5`).
+| folder | question | status |
+|---|---|---|
+| [**`cost-ab/`**](cost-ab/README.md) | Does pxpipe **cost less** on a real task? | **~break-even.** Compression is real but lands in `cache_read` (cheap at `$`, rumored-free at the subscription cap); session *divergence* dominates the totals. |
+| [**`effective-context/`**](effective-context/README.md) | Does pxpipe stay **sharp** in a context that overloads the plain column? | **unvalidated** — modern long-context Claude may not "drown," so run it before claiming a win. |
 
----
+What *is* validated: in the cost A/B's Rust-rewrite task, both columns ported a
+whole library to Rust and **both passed all 5 tests with the exact expected
+integers** — pxpipe through imaged spec + source. So compression **didn't break a
+precision task**. pxpipe's case rests on **capability** (not breaking real work,
+and effective context), not on saving tokens.
 
-## 1. Generate the context (prints the prompt + expected answer)
-```bash
-node demo/generate.mjs
-```
-
-## 2. Start the proxy (background, once)
-```bash
-npx pxpipe-proxy >/tmp/pxpipe.log 2>&1 &        # 127.0.0.1:47821
-```
-
-## 3. LEFT column — plain Claude (no proxy)
-```bash
-cd /Users/user/Downloads/repos/pixelpipe/demo
-claude
-```
-then: `/model claude-fable-5`
-
-## 4. RIGHT column — through pxpipe
-```bash
-cd /Users/user/Downloads/repos/pixelpipe/demo
-ANTHROPIC_BASE_URL=http://localhost:47821 claude      # or: pp
-```
-then: `/model claude-fable-5`
-
-## 5. Paste the prompt (from step 1's output) in BOTH columns
-It tells each to read every file in `context/` and answer the ZX-9 question with
-only the integer.
-
-## 6. The payoff
-- **RIGHT (pxpipe)** → answers the correct integer (it kept the needle readable
-  and the active context small).
-- **LEFT (plain)** → at a large enough context, gets it **wrong** — drowned in
-  the filler. That gap *is* the demo.
-- Also run **`/context`** in each: the right column is a fraction of the left.
-
-> If the LEFT column still answers correctly, the context isn't big enough to
-> push Fable into the dumb zone — raise `SIZE` in `generate.mjs`, regenerate, and
-> retry until plain Claude breaks. (If it never breaks, the win is the `/context`
-> reduction itself — report that honestly.)
+Shared tooling: [`../eval/ab/analyze.mjs`](../eval/ab/) reads the two proxy logs
+(`ab-on.jsonl` / `ab-off.jsonl`) and reports the honest cost comparison.
