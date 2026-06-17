@@ -115,7 +115,7 @@ describe('renderer', () => {
     expect(img.png.slice(0, 8)).toEqual(
       new Uint8Array([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]),
     );
-    expect(img.height).toBeLessThanOrEqual(1568);
+    expect(img.height).toBeLessThanOrEqual(1932);
     expect(img.width).toBeGreaterThan(0);
   });
 
@@ -123,7 +123,7 @@ describe('renderer', () => {
     const huge = ('lorem ipsum dolor sit amet '.repeat(20) + '\n').repeat(500);
     const imgs = await renderTextToPngs(huge);
     expect(imgs.length).toBeGreaterThan(1);
-    for (const img of imgs) expect(img.height).toBeLessThanOrEqual(1568);
+    for (const img of imgs) expect(img.height).toBeLessThanOrEqual(1932);
   });
 
   // ---- R2 multi-column renderer ------------------------------------------
@@ -148,16 +148,16 @@ describe('renderer', () => {
     const text = ('lorem ipsum dolor sit amet\n'.repeat(8)) + 'final line';
     const single = await renderTextToPngs(text, 100);
     const two = await renderTextToPngsMultiCol(text, 100, 2);
-    // numCols=2 with 100-col text content + 4-cell gutter at 7px/cell (7×10 production cell):
-    //   width = 2*PAD_X + 2*100*7 + 1*4*7 = 8 + 1400 + 28 = 1436 px
+    // numCols=2 with 100-col text content + 4-cell gutter at 5px/cell (5×8 production cell):
+    //   width = 2*PAD_X + 2*100*5 + 1*4*5 = 8 + 1000 + 20 = 1028 px
     expect(two[0]!.width).toBe(multiColWidth(100, 2));
     expect(two[0]!.width).toBeGreaterThan(single[0]!.width);
-    expect(two[0]!.width).toBeLessThanOrEqual(1568);
+    expect(two[0]!.width).toBeLessThanOrEqual(2000);
   });
 
   it('multi-col halves image count on row-heavy input', async () => {
-    // ~500 lines of narrow content. Single-col packs 195 lines/image →
-    // ~4 images. Two columns should drop that to ~2.
+    // ~500 lines of narrow content. Single-col packs 240 lines/image →
+    // ~3 images. Two columns should drop that to ~2.
     const text = ('lorem ipsum dolor sit amet\n'.repeat(500));
     const single = await renderTextToPngs(text, 100);
     const two = await renderTextToPngsMultiCol(text, 100, 2);
@@ -165,7 +165,7 @@ describe('renderer', () => {
     // Two-col image count ≤ ceil(single / 2). The +1 slack handles the
     // pathological case where the boundary lands awkwardly.
     expect(two.length).toBeLessThanOrEqual(Math.ceil(single.length / 2));
-    for (const img of two) expect(img.height).toBeLessThanOrEqual(1568);
+    for (const img of two) expect(img.height).toBeLessThanOrEqual(1932);
   });
 
   it('multi-col render is deterministic (byte-identical across calls)', async () => {
@@ -196,15 +196,15 @@ describe('renderer', () => {
     expect(estimated).toBe(actual);
   });
 
-  it('maxFittingCols clamps an over-wide numCols flag instead of producing >1568px canvases', async () => {
+  it('maxFittingCols clamps an over-wide numCols flag instead of producing >2000px canvases', async () => {
     // At cols=100 (5 px/cell + 4-cell gutter), the math says:
-    //   1: 508 px, 2: 1028, 3: 1548, 4: 2068 → 4 already exceeds 1568.
+    //   1: 508 px, 2: 1028, 3: 1548, 4: 2068 → 4 already exceeds 2000.
     const fits = maxFittingCols(100);
     expect(fits).toBe(3);
     const text = 'short\n'.repeat(10);
-    // numCols=10 → should clamp; output canvas width must stay ≤ 1568.
+    // numCols=10 → should clamp; output canvas width must stay ≤ 2000.
     const imgs = await renderTextToPngsMultiCol(text, 100, 10);
-    for (const img of imgs) expect(img.width).toBeLessThanOrEqual(1568);
+    for (const img of imgs) expect(img.width).toBeLessThanOrEqual(2000);
   });
 
   it('multi-col preserves CJK wide-glyph wrap math (no dropped chars on Chinese input)', async () => {
@@ -1913,16 +1913,16 @@ describe('transform', () => {
   // cell-H would).
 
   it('maxCharsPerImage: fills the canvas (READABLE_CHARS_PER_IMAGE = 50k)', () => {
-    // Policy: maximum chars per page, full 1568×1568 canvas. At cols=100 the
-    // canvas holds 100 × 195 = 19,500 chars per page (height-limited).
-    expect(maxCharsPerImage(100)).toBe(19_500);
+    // Policy: maximum chars per page, full ~1932-px-tall canvas. At cols=100 the
+    // canvas holds 100 × 240 = 24,000 chars per page (height-limited).
+    expect(maxCharsPerImage(100)).toBe(24_000);
   });
 
   it('maxCharsPerImage: scales with cols and caps at the 50k page budget', () => {
-    expect(maxCharsPerImage(20)).toBe(3_900);    // 20 × 195 = 3,900 (height-bound)
-    expect(maxCharsPerImage(50)).toBe(9_750);    // 50 × 195 = 9,750 (height-bound)
-    expect(maxCharsPerImage(200)).toBe(39_000);  // 200 × 195 = 39,000 (height-bound)
-    expect(maxCharsPerImage(313)).toBe(50_000);  // 313 × 195 = 61,035 → capped at READABLE
+    expect(maxCharsPerImage(20)).toBe(4_800);    // 20 × 240 = 4,800 (height-bound)
+    expect(maxCharsPerImage(50)).toBe(12_000);   // 50 × 240 = 12,000 (height-bound)
+    expect(maxCharsPerImage(200)).toBe(48_000);  // 200 × 240 = 48,000 (height-bound)
+    expect(maxCharsPerImage(313)).toBe(50_000);  // 313 × 240 = 75,120 → capped at READABLE
   });
 
   it('isCompressionProfitable: doubling cols halves the 2-image break-even threshold', () => {

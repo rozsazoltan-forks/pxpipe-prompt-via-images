@@ -31,11 +31,11 @@ import {
   renderTextToPngsWithCharLimit,
 } from '../src/core/render.js';
 
-// Default render config: cols=100, 195 lines/img → ~19,500 chars/img if
+// Default render config: cols=100, 240 lines/img → ~24,000 chars/img if
 // lines fully fill the width. For shorter lines, the budget is dominated
 // by row count (each line takes ≥1 row regardless of length).
 const COLS = 100;
-const ROWS_PER_IMG = 195; // floor((1568 - 8) / 8), Spleen 5×8 production cell
+const ROWS_PER_IMG = 240; // floor((1932 - 8) / 8), Spleen 5×8 production cell
 
 describe('estimateImageCount', () => {
   it('returns 1 for empty / tiny text', () => {
@@ -44,13 +44,13 @@ describe('estimateImageCount', () => {
   });
 
   it('scales linearly with row count for short-line content', () => {
-    // Full-canvas policy: 100 cols × 195 rows = 19,500 chars/page.
+    // Full-canvas policy: 100 cols × 240 rows = 24,000 chars/page.
     const oneImage = Array.from({ length: ROWS_PER_IMG }, () => 'x').join('\n');
     expect(estimateImageCount(oneImage, COLS)).toBe(1);
     // 196 short lines spill into a second page.
     const justOver = Array.from({ length: ROWS_PER_IMG + 1 }, () => 'x').join('\n');
     expect(estimateImageCount(justOver, COLS)).toBe(2);
-    // 10 × 195 rows → exactly 10 full pages.
+    // 10 × 240 rows → exactly 10 full pages.
     const tenImages = Array.from({ length: ROWS_PER_IMG * 10 }, () => 'x').join('\n');
     expect(estimateImageCount(tenImages, COLS)).toBe(10);
   });
@@ -59,11 +59,11 @@ describe('estimateImageCount', () => {
     // A single 1000-char line wraps to ceil(1000/100) = 10 rows.
     const wrapped = 'x'.repeat(1000);
     expect(estimateImageCount(wrapped, COLS)).toBe(1); // 10 rows, fits in 1 img
-    // 19,500 chars on one line wraps to 195 rows → exactly 1 full page.
-    const oneImg = 'x'.repeat(19_500);
+    // 24,000 chars on one line wraps to 240 rows → exactly 1 full page.
+    const oneImg = 'x'.repeat(24_000);
     expect(estimateImageCount(oneImg, COLS)).toBe(1);
-    // 19,501 chars overflows into a second page.
-    const twoImgs = 'x'.repeat(19_501);
+    // 24,001 chars overflows into a second page.
+    const twoImgs = 'x'.repeat(24_001);
     expect(estimateImageCount(twoImgs, COLS)).toBe(2);
   });
 
@@ -77,7 +77,7 @@ describe('estimateImageCount', () => {
 
 describe('dense readable render profile', () => {
   it('uses the bare 5×8 cell and multiple readable pages for lockfile-shaped text', async () => {
-    const lockish = Array.from({ length: 200 }, (_, i) =>
+    const lockish = Array.from({ length: 800 }, (_, i) =>
       `  pkg-${i}@npm:1.${i}.0(peer@npm:^${i}.0.0)(typescript@npm:^5.${i % 10}.0): checksum=${'a'.repeat(24)}`,
     ).join('\n');
 
@@ -89,15 +89,15 @@ describe('dense readable render profile', () => {
     );
 
     expect(imgs.length).toBeGreaterThanOrEqual(3);
-    // 180 cols × 5 px bare cell + padding — 2026-06-09 switched DENSE_RENDER_STYLE
-    // from the padded 7×10 cell (width ~1268) to 5×8 (width ~908) for Fable.
-    expect(imgs[0]!.width).toBeGreaterThan(890);
-    expect(imgs[0]!.width).toBeLessThanOrEqual(1568);
+    // 384 cols × 5 px bare cell + 8 px pad = 1928 px wide — the dense path fills
+    // the ~1932×1932 ceiling (≤2000 px) at the 5×8 cell for Fable / Opus 4.8.
+    expect(imgs[0]!.width).toBeGreaterThan(1900);
+    expect(imgs[0]!.width).toBeLessThanOrEqual(2000);
   });
 
   it('pages diff-shaped tool output at the dense readable budget', async () => {
     const diffish = Array.from(
-      { length: 160 },
+      { length: 2400 },
       (_, i) => `${i % 2 === 0 ? '+' : '-'}const value${i} = ${i}; // ${'changed '.repeat(8)}`,
     ).join('\n');
     expect(diffish.length).toBeGreaterThan(DENSE_CONTENT_CHARS_PER_IMAGE * 2);
@@ -113,8 +113,8 @@ describe('dense readable render profile', () => {
       Math.ceil(diffish.length / DENSE_CONTENT_CHARS_PER_IMAGE),
     );
     for (const img of imgs) {
-      expect(img.width).toBeLessThanOrEqual(1568);
-      expect(img.height).toBeLessThanOrEqual(1568);
+      expect(img.width).toBeLessThanOrEqual(2000);
+      expect(img.height).toBeLessThanOrEqual(1932);
     }
   });
 });
@@ -203,7 +203,7 @@ describe('truncateForBudget', () => {
 
   it('truncates head+tail for log-shaped content over the budget', () => {
     // 10k log lines, each ~32 chars → ~320k chars total. With short lines
-    // the row budget dominates: 10k rows >> 10 × 195 = 1950 row budget.
+    // the row budget dominates: 10k rows >> 10 × 240 = 2400 row budget.
     const lines: string[] = [];
     for (let i = 0; i < 10_000; i++) {
       lines.push(`2026-05-18T12:00:${String(i % 60).padStart(2, '0')}Z entry ${i}`);
@@ -343,7 +343,7 @@ function makeReq(toolResultText: string) {
 describe('paging end-to-end (transformRequest)', () => {
   it('tool_result under cap renders normally (no truncation counters)', async () => {
     // Above the multi-col break-even (~22k chars), well under the 10-image
-    // single-column budget (~195k chars at the current 5×8 atlas).
+    // single-column budget (~920k chars = 10 × ~92k DENSE at the 5×8 atlas).
     // charsPerToken:2 reflects reality (tool_result content is code/logs, ~2 ch/tok)
     // and ensures the gate accepts this size at numCols=1.
     const text = 'x'.repeat(50_000);
@@ -355,11 +355,12 @@ describe('paging end-to-end (transformRequest)', () => {
   });
 
   it('pages dense medium tool_results instead of packing them into one image', async () => {
-    const lockish = Array.from({ length: 200 }, (_, i) =>
+    const lockish = Array.from({ length: 1200 }, (_, i) =>
       `  pkg-${i}@npm:1.${i}.0(peer@npm:^${i}.0.0)(typescript@npm:^5.${i % 10}.0): checksum=${'a'.repeat(24)}`,
     ).join('\n');
-    expect(lockish.length).toBeGreaterThan(18_000);
-    expect(lockish.length).toBeLessThan(24_000);
+    // > one dense page (DENSE_CONTENT_CHARS_PER_IMAGE ≈ 92k) so it genuinely pages.
+    expect(lockish.length).toBeGreaterThan(100_000);
+    expect(lockish.length).toBeLessThan(150_000);
 
     const { info } = await transformRequest(makeReq(lockish), { multiCol: 1, charsPerToken: 2 });
     expect(info.compressed).toBe(true);
@@ -371,7 +372,7 @@ describe('paging end-to-end (transformRequest)', () => {
   });
 
   it('tool_result over cap fires truncation, lands ≤ 10 images', async () => {
-    // ~500k char log → ~36 raw images, should clamp to ≤10.
+    // ~500k char log → ~42 raw images (10k rows / 240), should clamp to ≤10.
     const lines: string[] = [];
     for (let i = 0; i < 10_000; i++) {
       lines.push(`2026-05-18T12:00:00Z entry ${i} payload content here`);

@@ -76,6 +76,17 @@ export interface HistoryCollapseOptions {
    *  fresh `cache_create` (1.25x) of the whole prefix on every single turn.
    *  Set to 0 for the legacy per-turn moving boundary. Default 50. */
   collapseChunk: number;
+  /** Number of leading messages to NEVER collapse. The caller splices the
+   *  system-prompt + tool-docs slab (rendered as images) into the first user
+   *  message BEFORE history collapse runs. If collapse is allowed to sweep
+   *  that message into the history image, `blocksToText` reduces the slab
+   *  images to literal `[image]` placeholders — destroying the system prompt
+   *  and tool docs for the turn — AND the slab's `cache_control` anchor goes
+   *  with it, so every grid-crossing re-render invalidates the whole prefix.
+   *  Protecting the leading slab message keeps it at the front as the stable,
+   *  marked cache anchor; the history image is inserted AFTER it. Default 0
+   *  (legacy: collapse from the head). */
+  protectedPrefix: number;
 }
 
 export const HISTORY_DEFAULTS: HistoryCollapseOptions = {
@@ -83,6 +94,7 @@ export const HISTORY_DEFAULTS: HistoryCollapseOptions = {
   minCollapsePrefix: 10,
   cols: 100,
   collapseChunk: 50,
+  protectedPrefix: 0,
 };
 
 /** Per-request telemetry surfaced back to TransformInfo. */
@@ -245,9 +257,10 @@ export function blocksToText(content: string | ContentBlock[]): string {
 export function messagesToHistoryText(
   messages: Message[],
   upToExclusive: number,
+  fromInclusive = 0,
 ): string {
   const out: string[] = [];
-  for (let i = 0; i < upToExclusive; i++) {
+  for (let i = fromInclusive; i < upToExclusive; i++) {
     const m = messages[i]!;
     const body = blocksToText(m.content);
     if (!body.trim()) continue;
@@ -287,6 +300,14 @@ export async function collapseHistory(
     info.reason = 'no_history';
     return { messages: messages ?? [], info };
   }
+  // Leading messages the caller has marked off-limits (the slab-bearing first
+  // user message — see `protectedPrefix` jsdoc). The collapsed run starts at
+  // this index; everything before it is passed through untouched so the slab
+  // image + its cache_control anchor stay at the front of the request.
+  const protectedPrefix = Math.max(
+    0,
+    Math.min(o.protectedPrefix ?? 0, messages.length),
+  );
   // The live tail must contain at least `keepTail` messages. The boundary
   // search cuts off at `len - keepTail` so the tail is always preserved.
   //
@@ -298,20 +319,23 @@ export async function collapseHistory(
   // image — byte-identical for `collapseChunk` turns at a stretch, so the
   // history image caches like Claude Code's native byte-stable history.
   const rawCutoff = messages.length - o.keepTail;
-  // Snap the cutoff to the grid, but never below `minCollapsePrefix`. A
-  // conversation shorter than one full `collapseChunk` would otherwise
-  // floor straight to 0 and skip history compression entirely. Flooring
-  // at `minCollapsePrefix` instead keeps the boundary — and therefore the
+  // Snap the cutoff to the grid, but never below `minCollapsePrefix` turns of
+  // ACTUAL collapsible content — i.e. `minCollapsePrefix + protectedPrefix`,
+  // since the protected leading message(s) sit inside `[0..cutoff)` but are
+  // excluded from the collapse. Without the `+ protectedPrefix` term a small
+  // conversation could never reach `minCollapsePrefix` collapsible turns (the
+  // protected slab would always eat one slot). A conversation shorter than one
+  // full `collapseChunk` would otherwise floor straight to 0 and skip history
+  // compression entirely. Flooring keeps the boundary — and therefore the
   // rendered image — byte-stable (the prefix is append-only, so its first
-  // `minCollapsePrefix` messages never change) while still collapsing
-  // short histories. Clamp to `rawCutoff` so a floor can never reach past
-  // the live tail when `rawCutoff < minCollapsePrefix`.
+  // messages never change) while still collapsing short histories. Clamp to
+  // `rawCutoff` so a floor can never reach past the live tail.
   const cutoff =
     o.collapseChunk > 0
       ? Math.min(
           rawCutoff,
           Math.max(
-            o.minCollapsePrefix,
+            o.minCollapsePrefix + protectedPrefix,
             Math.floor(rawCutoff / o.collapseChunk) * o.collapseChunk,
           ),
         )
@@ -321,16 +345,20 @@ export async function collapseHistory(
     info.reason = 'no_closed_prefix';
     return { messages, info };
   }
-  // boundary is the last index INCLUDED in the collapse. Need at least
-  // `minCollapsePrefix` turns to bother (cache-amortization math from
-  // round-3 only works at scale; collapsing 2-3 turns is net cost).
+  // boundary is the last index INCLUDED in the collapse. `findClosedPrefixBoundary`
+  // guarantees `[0..boundary]` is tool-closed; the protected prefix is itself
+  // tool-closed (the slab message carries no tool_use), so the collapsed range
+  // `[protectedPrefix..boundary]` is closed too. Need at least
+  // `minCollapsePrefix` turns in that range to bother (cache-amortization math
+  // from round-3 only works at scale; collapsing 2-3 turns is net cost).
   const collapseLen = boundary + 1;
-  if (collapseLen < o.minCollapsePrefix) {
+  if (collapseLen - protectedPrefix < o.minCollapsePrefix) {
     info.reason = 'prefix_too_short';
     return { messages, info };
   }
-  // Serialize and gate on break-even.
-  const text = messagesToHistoryText(messages, collapseLen);
+  // Serialize and gate on break-even. Start at `protectedPrefix` so the slab
+  // message is excluded — never re-imaged into the history blob as `[image]`.
+  const text = messagesToHistoryText(messages, collapseLen, protectedPrefix);
   if (!text || text.length === 0) {
     info.reason = 'render_empty';
     return { messages, info };
@@ -377,9 +405,13 @@ export async function collapseHistory(
     role: 'user',
     content: syntheticContent,
   };
+  const head = messages.slice(0, protectedPrefix);
   const tail = messages.slice(collapseLen);
-  info.collapsedTurns = collapseLen;
+  info.collapsedTurns = collapseLen - protectedPrefix;
   info.collapsedChars = text.length;
   info.collapsedImages = imageBlocks.length;
-  return { messages: [syntheticUser, ...tail], info };
+  // [...protected slab message(s), synthetic history image, ...live tail].
+  // The slab stays at the front carrying its cache_control anchor; the history
+  // image sits AFTER it, so a history re-render never invalidates the slab.
+  return { messages: [...head, syntheticUser, ...tail], info };
 }

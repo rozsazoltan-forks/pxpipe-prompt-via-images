@@ -2,8 +2,8 @@
 
 **Cut Claude Code input-token spend by rendering bulky context as images.**
 
-Anthropic bills a 1568px-wide image at a flat rate regardless of how much text
-is inside it. Dense content (code, JSON, tool output) packs ~3.1 chars per
+Anthropic bills an image by its pixel dimensions, not by how much text is
+inside it. Dense content (code, JSON, tool output) packs ~3.1 chars per
 image-token vs ~1 char per text-token on real Claude Code traffic. pxpipe is a
 local proxy that exploits that gap: it rewrites the bulky parts of your
 request (system prompt, tool docs, older history) into compact PNGs before
@@ -171,7 +171,7 @@ the agent re-reads files before editing; pure chat recall has no such check.
 ## How it works
 
 ```
-tool_result string ──► wrap at 1568px-wide columns ──► pack ~5,000 chars/page ──► PNG[]
+tool_result string ──► wrap at 1928px-wide columns ──► pack ~92,000 chars/page ──► PNG[]
 ```
 
 The proxy intercepts `/v1/messages`, rewrites eligible bulk history into image
@@ -179,10 +179,10 @@ blocks, splices them back cache-friendly (static prefix preserved, so prompt
 caching keeps working), and forwards. Per-request events log to
 `~/.pxpipe/events.jsonl`.
 
-The economics: a 1568×1568 image costs ≈1,568 vision tokens and holds ≈5,000
-readable chars (≈1,250 text tokens), so plain text is cheaper *unless* your
-text is token-dense. Claude Code transcripts are (observed 1.91 chars/token,
-N=391). The runtime estimator (`estimateImageCount`) plus a chars/token gate
+The economics: a 1928×1928 image costs ≈4,761 vision tokens and holds ≈92,000
+readable chars (≈48,000 text tokens at the observed density), so plain text is
+cheaper *only* when it runs denser than ~19 chars/token. Claude Code transcripts
+are far below that (observed 1.91 chars/token, N=391). The runtime estimator (`estimateImageCount`) plus a chars/token gate
 decides per-request; sparse prose is left as text.
 
 ## Library use (no proxy)

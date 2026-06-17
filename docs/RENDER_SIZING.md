@@ -7,22 +7,33 @@ both were considered, and one was built and reverted.
 
 ## TL;DR — current behavior
 
-A rendered page is a **fixed-width, variable-height** image. It is **never
-squared** and **never shrunk horizontally to fit short lines**.
+A rendered page is a **fixed-width, variable-height** image. It is **not
+deliberately squared** and **never shrunk horizontally to fit short lines**.
 
-- **Width is constant**, set only by the column count, not by content:
-  `width = 2·PAD_X + cols·CELL_W` → `8 + 313·5 = 1573px` at the defaults.
+- **Width is constant per path**, set by the column count, not by content:
+  `width = 2·PAD_X + cols·CELL_W`. The static slab renders at `DEFAULT_COLS=313`
+  → `8 + 313·5 = 1573px`; dense tool/history pages render at
+  `DENSE_CONTENT_COLS=384` → `8 + 384·5 = 1928px`.
 - **Height grows to fit the lines on the page**, capped, then pages:
   `height = 2·PAD_Y + nLines·CELL_H` → `8 + 8·nLines`.
 - **Vertical cap → paging**: `maxLines = floor((MAX_HEIGHT_PX − 2·PAD_Y) / CELL_H)`
-  `= floor(1560/8) = 195` lines. Overflow goes to the next image, it does not
-  grow the canvas. A *full* page is `1573 × 1568` (near-square by coincidence at
-  313 cols); a *partial* page (small tool_result, last page) is wide-and-short,
-  e.g. `1573 × 160`.
+  `= floor(1924/8) = 240` lines. Overflow goes to the next image, it does not
+  grow the canvas. A *full dense* page is `1928 × 1928` (≈square only because
+  384 cols ≈ 240 rows at the 5×8 cell — not deliberately squared); a *full slab*
+  page is `1573 × 1280` (~159 rows, READABLE-bound below the 240 cap); a
+  *partial* page (small tool_result, last page) is wide-and-short, e.g. `1928 × 160`.
+
+This `~1932×1932` ceiling is the largest page Fable / Opus 4.8 accept without a
+server-side resize. Those models take up to **2576 px** on the long edge, but a
+request with **>20 images** (pxpipe always sends many) is held to the stricter
+**≤2000 px/side** rule, and `1928×1928` = `69×69` = **4761 visual tokens**, just
+under the **4784**-token per-image cap. Going bigger gets the request *rejected*,
+not downscaled.
 
 Source of truth: `renderChunkToPng` in `src/core/render.ts` (the `width` /
 `height` lines), constants `PAD_X=PAD_Y=4`, `CELL_W=5`, `CELL_H=8` (the "5×8
-cell"), `DEFAULT_COLS=313`, `MAX_HEIGHT_PX=1568`, `READABLE_CHARS_PER_IMAGE=50000`.
+cell"), `DEFAULT_COLS=313`, `DENSE_CONTENT_COLS=384`, `MAX_HEIGHT_PX=1932`,
+`READABLE_CHARS_PER_IMAGE=50000`, `DENSE_CONTENT_CHARS_PER_IMAGE=92160`.
 
 ## The cell
 
@@ -59,17 +70,24 @@ Anthropic bills images by **pixel area** (≈ `w·h/750`), not by the longest ed
 So a square is not cheaper than a wide-short image of the same area — what
 minimizes cost is the *tightest bounding box around the text*, and for dense
 reflowed content that box is exactly "full width × just enough rows," which is
-what we render. Squaring would usually *increase* area (pad height or drop
-columns) for no benefit. Aspect ratio is a non-goal; **chars-per-pixel** is the
-goal, achieved by filling every row to `cols` and paging vertically.
+what we render. We never *pad* to a square: a full dense page lands at
+`1928×1928` only because 384 cols and 240 rows are equal pixel extents at the
+5×8 cell — it's the max-chars-per-page point (the ~1932² token ceiling), not an
+aspect-ratio target, and a partial page stays wide-and-short. Aspect ratio is a
+non-goal; **chars-per-pixel** is the goal, achieved by filling every row to
+`cols` and paging vertically.
 
 ## Two render paths
 
-- **tool_result / history images**: single-column, paged at the 195-line cap.
-- **system-slab image**: kept on a path that *can* use multi-column packing
-  (`shrinkWidth=false`), but multi-col is **disabled by default** (`multiCol: 1`)
-  because at 313 cols a single column already holds ~50k chars/page and
-  multi-col adds OCR column-ordering risk without meaningful savings.
+- **tool_result / history images**: single-column at `DENSE_CONTENT_COLS=384`
+  (1928px wide), paged at the 240-line cap → full pages are `1928×1928`
+  (~92k chars each).
+- **system-slab image**: single-column at `DEFAULT_COLS=313` (1573px wide),
+  READABLE-bound to ~159 rows (~50k chars → `1573×1280`). Kept on a path that
+  *can* use multi-column packing (`shrinkWidth=false`), but multi-col is
+  **disabled by default** (`multiCol: 1`) because at 313 cols a single column
+  already holds ~50k chars/page and multi-col adds OCR column-ordering risk
+  without meaningful savings.
 
 So in practice everything is single-column full-width today; the multi-col code
 is retained for backward compat.
@@ -123,6 +141,7 @@ The sizing converged through measured iteration, not a single design. Key commit
 | 2026-05-25 | `bb8e0d8` | **page** dense tool/history images | enforce the 195-line cap, split overflow |
 | 2026-05-26 | `28bc65c` | reduce dense page size | tuning |
 | 2026-06-09 | `cdfc99d` | drop Opus, **Fable-5 only**; dense render on bare 5×8 cell | Opus misread ~7% of renders |
+| 2026-06-17 | (this change) | raise page ceiling to **~1932×1932**: `MAX_HEIGHT_PX=1932`, dense pages `DENSE_CONTENT_COLS=384` / `92160` chars; row cap follows each call's char budget | Fable/Opus 4.8 accept ≤2000px & ≤4784 tok/image (not the old 1568 limit); baseline left ~3× headroom unused → bigger pages = fewer image blocks at the same 5×8 legibility |
 
 The arc: **reflow** to stop wasting rows → **eval harness** to prove the packing
 is still readable → **width-shrink** experiment → **reverted** to full-canvas

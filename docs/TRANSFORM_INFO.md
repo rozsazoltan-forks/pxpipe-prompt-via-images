@@ -15,8 +15,8 @@ to re-read that text in token form — Anthropic prompt-caches it, and image
 blocks OCR cleanly at small font sizes. So pxpipe pulls the static prefix
 out of the JSON body, renders it as one or more grayscale PNG image blocks,
 and pins a single `cache_control` breakpoint on the last image. Anthropic
-charges roughly `ceil(W*H/750)` tokens per image; our renderer caps each image
-at 1466×1568, so each tile costs ~3066 tokens regardless of how much text it
+charges roughly `ceil(W*H/750)` tokens per image; a full static-slab page is
+1573×1280, so each slab tile costs ~2684 tokens regardless of how much text it
 carries. A 68K-token static slab collapses to ~3.5K image tokens on the first
 turn and to a cache-read (billed at 0.10×) on every subsequent turn. The
 trade is real text tokens for a few image tokens we cache once.
@@ -263,7 +263,7 @@ NOT compressed:
 
 ```
 text_tokens_we_removed = origChars / 4              # ~4 chars per token, rough
-image_tokens_we_added  = imageCount * 3066          # 1466*1568 ≈ 3066 tokens
+image_tokens_we_added  = imageCount * 4761          # dense 1928×1928 ≈ 4761 tokens (slab ~2684)
 extra_text_baseline    = max(0, text_tokens_we_removed - image_tokens_we_added)
 
 # cache_create dominates the first turn; bias the baseline toward 1.25 in

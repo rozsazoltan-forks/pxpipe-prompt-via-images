@@ -480,19 +480,28 @@ describe('transformRequest history compression (always-on)', () => {
     expect(Array.isArray(reparsed.messages)).toBe(true);
   });
 
-  it('collapses a 10-closed + 4-live conversation under the default keepTail=4', async () => {
-    // 14 turns total. Default keepTail=4 + minPrefix=10 means 10 turns
-    // collapse into 1 synthetic prepended user + 4 live tail = 5 total.
-    // Per-turn body 3500 chars puts the fixture comfortably above the
-    // row-aware profitability gate (numCols=1 at the renderer means each
-    // 3500-char `x` line wraps to 35 rows; 10 turns × ~36 rows = ~360 rows
-    // = 3 single-col images ≪ text-cost).
+  it('collapses 10 closed turns after the protected slab message (keepTail=4)', async () => {
+    // 15 turns total. The big system slab is imaged into the FIRST user
+    // message, which is then protected from collapse (protectedPrefix=1).
+    // Default keepTail=4 + minPrefix=10 means 10 turns collapse into 1
+    // synthetic user, placed AFTER the slab message: slab + synthetic + 4 live
+    // = 6 total. Per-turn body 3500 chars puts the fixture comfortably above
+    // the row-aware profitability gate.
     const msgs: Message[] = [];
-    for (let i = 0; i < 14; i++) {
+    for (let i = 0; i < 15; i++) {
       const body = `turn ${i}: ` + bigPlain(3500);
       msgs.push(i % 2 === 0 ? usr(body) : asst(body));
     }
-    const { body, info } = await transformRequest(mkBody(msgs, bigPlain(80_000)));
+    // Marked system (as real Claude Code sends) so the cache_control anchor
+    // relocates onto the slab image — lets us assert the marker survives.
+    const markedBody = new TextEncoder().encode(
+      JSON.stringify({
+        model: 'claude-3-5-sonnet',
+        system: [{ type: 'text', text: bigPlain(80_000), cache_control: { type: 'ephemeral' } }],
+        messages: msgs,
+      }),
+    );
+    const { body, info } = await transformRequest(markedBody);
     expect(info.collapsedTurns).toBe(10);
     expect(info.collapsedChars).toBeGreaterThan(0);
     expect(info.collapsedImages).toBeGreaterThanOrEqual(1);
@@ -500,9 +509,22 @@ describe('transformRequest history compression (always-on)', () => {
     expect(info.imageCount).toBeGreaterThanOrEqual(1 + (info.collapsedImages ?? 0));
 
     const reparsed = JSON.parse(new TextDecoder().decode(body));
-    expect(reparsed.messages.length).toBe(5); // 1 synthetic + 4 live tail
-    expect(reparsed.messages[0].role).toBe('user');
-    const content = reparsed.messages[0].content;
+    expect(reparsed.messages.length).toBe(6); // slab + 1 synthetic + 4 live tail
+
+    // REGRESSION (slab survives collapse): messages[0] is the slab-bearing
+    // first user message, NOT the synthetic history. It must still carry a real
+    // image (the system prompt + tool docs) AND the cache_control anchor — if
+    // collapse had swept it in, the slab would be reduced to an `[image]`
+    // placeholder and the marker would be gone.
+    const slabMsg = reparsed.messages[0];
+    expect(slabMsg.role).toBe('user');
+    const slabImgs = slabMsg.content.filter((b: { type: string }) => b.type === 'image');
+    expect(slabImgs.length).toBeGreaterThanOrEqual(1);
+    expect(slabImgs.some((b: { cache_control?: unknown }) => b.cache_control !== undefined)).toBe(true);
+
+    // The synthetic history image is at messages[1], AFTER the slab anchor.
+    expect(reparsed.messages[1].role).toBe('user');
+    const content = reparsed.messages[1].content;
     expect(Array.isArray(content)).toBe(true);
     expect(content[0]).toMatchObject({ type: 'text', text: '[Earlier in this conversation:]' });
     expect(content[content.length - 1]).toMatchObject({
@@ -538,7 +560,7 @@ describe('transformRequest history compression (always-on)', () => {
     //   • > text-tokens at cpt=4   → REJECT under stale/default prose cpt
     //   • < text-tokens at cpt=2.0 → ACCEPT under Opus 4.7 telemetry
     const msgs: Message[] = [];
-    for (let i = 0; i < 14; i++) {
+    for (let i = 0; i < 15; i++) {
       const body = `turn ${i}: ` + bigPlain(900);
       msgs.push(i % 2 === 0 ? usr(body) : asst(body));
     }
@@ -577,7 +599,7 @@ describe('transformRequest history compression (always-on)', () => {
     // with the fix it stays rejected, confirming the gate honored the literal
     // 4. The companion test below pins cpt=2.0 collapse on the same shape.
     const msgs: Message[] = [];
-    for (let i = 0; i < 14; i++) {
+    for (let i = 0; i < 15; i++) {
       const body = `turn ${i}: ` + bigPlain(900);
       msgs.push(i % 2 === 0 ? usr(body) : asst(body));
     }
@@ -598,17 +620,19 @@ describe('transformRequest history compression (always-on)', () => {
     expect(explicit20.info.collapsedTurns).toBe(10);
   });
 
-  it('history-image blocks carry NO cache_control (conservative first-cut)', async () => {
+  it('history-image blocks carry NO cache_control (slab anchor is the sole breakpoint)', async () => {
     const msgs: Message[] = [];
-    for (let i = 0; i < 14; i++) {
+    for (let i = 0; i < 15; i++) {
       const body = `turn ${i}: ` + bigPlain(3500);
       msgs.push(i % 2 === 0 ? usr(body) : asst(body));
     }
     const { body, info } = await transformRequest(mkBody(msgs, bigPlain(80_000)));
     expect(info.collapsedImages).toBeGreaterThanOrEqual(1);
     const reparsed = JSON.parse(new TextDecoder().decode(body));
-    const synth = reparsed.messages[0];
+    // Synthetic history is at messages[1], after the protected slab anchor.
+    const synth = reparsed.messages[1];
     const imgs = synth.content.filter((b: { type: string }) => b.type === 'image');
+    expect(imgs.length).toBeGreaterThanOrEqual(1);
     for (const img of imgs) {
       expect(img.cache_control).toBeUndefined();
     }

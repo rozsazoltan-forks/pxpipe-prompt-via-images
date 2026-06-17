@@ -4,8 +4,8 @@
  * Token and USD cost estimation for the reflow eval harness.
  * Based on Claude claude-sonnet-4-5 pricing (May 2026).
  *
- * Image token formula: Anthropic charges a fixed cost per image tile.
- * For images ≤ 1568×1568: 1 tile = ~1600 tokens (vision overhead).
+ * Image token formula: Anthropic charges by pixel area (≈ ⌈w/28⌉·⌈h/28⌉ patches).
+ * A full dense ~1928×1928 page ≈ 69×69 = 4761 vision tokens.
  * We use the empirically-measured 1.17 chars/token for text.
  */
 
@@ -17,12 +17,12 @@ export const MODELS = {
   'claude-sonnet-4-5': {
     inputPerMtok:  3.00,
     outputPerMtok: 15.00,
-    imageTileTokens: 1600,   // tokens charged per image (≤1568×1568)
+    imageTileTokens: 4761,   // dense 1928×1928 page = 69×69 patches
   },
   'claude-haiku-4-5': {
     inputPerMtok:  0.80,
     outputPerMtok:  4.00,
-    imageTileTokens: 1600,
+    imageTileTokens: 4761,
   },
 };
 
@@ -46,7 +46,7 @@ export function estimateTextTokens(text) {
 }
 
 /**
- * Estimate tokens for N rendered PNGs (each ≤ 1568×1568 = 1 tile).
+ * Estimate tokens for N rendered PNGs (each dense page ≈ 1928×1928).
  * @param {number} imageCount
  * @param {string} model
  * @returns {number}
@@ -58,7 +58,7 @@ export function estimateImageTokens(imageCount, model = DEFAULT_MODEL) {
 
 /**
  * Rough estimate of how many PNGs renderTextToPngs will produce for a given
- * text, at 100 cols, ATLAS_CELL_H=8px, MAX_HEIGHT_PX=1568.
+ * text, at 100 cols, ATLAS_CELL_H=8px, MAX_HEIGHT_PX=1932.
  * Mirrors the calculation in src/core/render.ts.
  *
  * @param {string} text
@@ -68,7 +68,7 @@ export function estimateImageTokens(imageCount, model = DEFAULT_MODEL) {
 export function estimateImageCount(text, cols = 100) {
   const CELL_H = 8;
   const PAD_Y  = 4;
-  const MAX_H  = 1568;
+  const MAX_H  = 1932;
   const linesPerImg = Math.max(1, Math.floor((MAX_H - 2 * PAD_Y) / CELL_H));
 
   // Estimate wrapped line count: chars per row ≈ cols

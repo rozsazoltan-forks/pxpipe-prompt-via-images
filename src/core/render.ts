@@ -8,8 +8,12 @@
  * U+FFFF — which are not in our atlas anyway — round-trip cleanly as a
  * single dropped-char event rather than two corrupt halves.
  *
- * Anthropic's vision encoder works best with images ≤ 1568×1568 px, so we
- * cap height there and split into N PNGs when content exceeds the budget.
+ * Fable / Opus 4.8 accept images up to 2576 px on the long edge / 4784 visual
+ * tokens — but a request with >20 images (we always send many) is held to the
+ * stricter ≤2000 px/side rule (over that the request is REJECTED, not silently
+ * downscaled). So we cap pages at the ~1932×1932 ceiling (≤2000 px AND ≤4784
+ * tokens: ⌈1928/28⌉² = 69² = 4761) and split into N PNGs when content exceeds
+ * the budget. Pages never trip a server-side resize.
  */
 
 import {
@@ -30,21 +34,29 @@ import {
 } from './atlas-gray.js';
 import { encodeGrayPng, encodeRgbPng } from './png.js';
 
-/** Vertical pixel budget per rendered PNG. Bounded by Anthropic's 1568×1568
- *  image cap. Exported so the break-even gate in transform.ts can derive
- *  CHARS_PER_IMAGE from the same constants the renderer actually uses. */
-export const MAX_HEIGHT_PX = 1568;
-/** Target upper bound for source text represented by one PNG page.
- *  At 313 cols × 196 rows the 1568×1568 canvas holds ~61k chars; we pack
- *  to ~50k to leave headroom for soft-wrap, dropped chars, and the paging
- *  marker. Policy: fill the canvas, one page per 1568×1568 image, max savings. */
+/** Vertical pixel budget per rendered PNG = the page-height ceiling. 1932 px so
+ *  a full-width 384-col page is 1928×1928 = 69×69 = 4761 visual tokens — under
+ *  both Anthropic limits for Fable / Opus 4.8: ≤4784 tokens AND ≤2000 px/side
+ *  (the >20-images rule, which we always trip, capping below the models' 2576 px
+ *  native max). Exported so the break-even gate in transform.ts derives its
+ *  CHARS_PER_IMAGE math from the same constant the renderer actually uses. */
+export const MAX_HEIGHT_PX = 1932;
+/** Char budget for the STATIC slab (system + tools + CLAUDE.md). At cols=313
+ *  this packs ~159 rows → ~1573×1280 px pages — comfortably under the ~1932²
+ *  ceiling. We deliberately keep the cached prefix at this modest page size
+ *  (it was never the OCR concern); the dense path below fills the full ceiling.
+ *  ~50k leaves headroom for soft-wrap, dropped chars, and the paging marker. */
 export const READABLE_CHARS_PER_IMAGE = 50000;
-/** Target source chars per image for dense user-visible content (tool output
- *  and collapsed history). The 50k canvas-max page is token-efficient but too
- *  dense for OCR on lockfiles/JSON/code. Keep those blocks paged into smaller
- *  images so the model can read them reliably. */
-export const DENSE_CONTENT_CHARS_PER_IMAGE = 5000;
-export const DENSE_CONTENT_COLS = 180;
+/** Dense user-visible content (tool output, collapsed history). 384 cols → 1928
+ *  px wide; with MAX_HEIGHT_PX=1932 the row cap is 240, so a full page is
+ *  1928×1928 = 92160 chars = the ~1932² ceiling (≤2000 px, ≤4784 tokens) → the
+ *  API never downscales it. Per-char OCR fidelity rides on the 5×8 render CELL
+ *  (validated 98.95% char accuracy on Opus 4.7 w/ reflow+grayscale — see
+ *  DEFAULT_CELL_*_BONUS), which is independent of page size, so bigger pages =
+ *  fewer image blocks at the same legibility. NOTE: exact/verbatim recall of
+ *  imaged text is unreliable at ANY size — for that, content must stay text. */
+export const DENSE_CONTENT_CHARS_PER_IMAGE = 92160;
+export const DENSE_CONTENT_COLS = 384;
 /** 2026-06-09: dropped the 7×10 padded cell ({cellWBonus:2, cellHBonus:2})
  *  to the bare 5×8 atlas cell for the Fable-only scope — A/B on dense JSON
  *  needles read 4/5 at 5×8 vs 3/5 at 7×10 (n=5, flat) at 42% fewer image
@@ -52,8 +64,10 @@ export const DENSE_CONTENT_COLS = 180;
  *  is unreliable at every cell size; the verbatim-risk guard is the
  *  mitigation, not padding. Revert to {2,2} if misread rates rise. */
 export const DENSE_RENDER_STYLE: RenderStyle = { cellWBonus: 0, cellHBonus: 0, aa: true };
-/** Default columns per row. 1568 px / 5 px-per-cell = 313 cells. We render
- *  at the full canvas width by default — no shrink-to-content. */
+/** Default columns per row (static slab). 313 cells × 5 px + 8 px pad = 1573 px
+ *  — under the ~1932 px (≤2000 px) page ceiling, so the slab is never
+ *  downscaled. We render at the full slab width by default — no
+ *  shrink-to-content. (Dense/tool pages widen to DENSE_CONTENT_COLS=384.) */
 const DEFAULT_COLS = 313;
 /** Horizontal padding inside the rendered PNG (left + right each). Exported
  *  so transform.ts can derive image pixel-area for token-cost estimation. */
@@ -771,7 +785,11 @@ export async function renderTextToPngsWithCharLimit(
   const cellH = ATLAS_CELL_H + Math.max(0, Math.floor(style.cellHBonus ?? DEFAULT_CELL_H_BONUS));
   const lines = wrapLines(text, cols, markerScale);
   const hardLinesPerImg = Math.max(1, Math.floor((MAX_HEIGHT_PX - 2 * PAD_Y) / cellH));
-  const linesPerImg = Math.min(hardLinesPerImg, readableLinesPerColumn(cols));
+  // Row cap follows THIS call's char budget, not the global READABLE — so a
+  // dense page (DENSE_CONTENT_CHARS_PER_IMAGE at DENSE_CONTENT_COLS=384) fills
+  // the full ~1932 px height (240 rows) instead of being held to the slab's
+  // row count. For the slab the budget IS READABLE, so output is unchanged.
+  const linesPerImg = Math.min(hardLinesPerImg, Math.max(1, Math.floor(maxCharsPerImage / cols)));
 
   const images: RenderedImage[] = [];
   for (const page of splitWrappedLinesIntoReadablePages(lines, linesPerImg, maxCharsPerImage)) {
@@ -791,7 +809,7 @@ export async function renderTextToPngs(
 
 // --- R2 multi-column rendering --------------------------------------------
 //
-// Single-column packing leaves Anthropic's 1568×1568 image area badly
+// Single-column packing leaves the ~1932×1932 image budget badly
 // under-used: at the 5×8 cell and cols=100, our render canvas is only
 // 508 px wide — ~32% of the horizontal budget. Most real Claude Code tool
 // docs + CLAUDE.md content wraps well under 100 chars/row, so we end up
@@ -809,7 +827,13 @@ export async function renderTextToPngs(
 // becoming the default. Until then this lives behind an opt-in flag.
 
 const GUTTER_CELLS = 4;
-const MAX_WIDTH_PX = 1568;
+// Width ceiling for the multi-col packer. The >20-images rule allows ≤2000 px
+// per side, but the 4784-token cap is the STRICTER bound at full page height:
+// a 1932-px-tall page is ⌈1932/28⌉ = 69 patches, so width must also stay ≤ 69
+// patches (69×69 = 4761 ≤ 4784) — i.e. ≤ 1932 px. A 2000-px width (72 patches)
+// at full height would be 72×69 = 4968 > 4784 and the request would be REJECTED.
+// So we cap at the binding limit (1932), not the looser 2000-px side limit.
+const MAX_WIDTH_PX = 1932;
 
 /** Mid-gray ink level for the multicol gutter divider, BEFORE the final
  *  `255 - fb[i]` invert that flips the framebuffer to black-on-white. 64
@@ -832,7 +856,7 @@ export function multiColWidth(cols: number, numCols: number): number {
 }
 
 /** Largest `numCols` that fits within MAX_WIDTH_PX at `cols`. Useful for the
- *  CLI clamp so an over-large flag doesn't produce >1568px PNGs. */
+ *  CLI clamp so an over-large flag doesn't produce >2000px PNGs. */
 export function maxFittingCols(cols: number): number {
   let n = 1;
   while (multiColWidth(cols, n + 1) <= MAX_WIDTH_PX) n++;
@@ -891,9 +915,9 @@ async function renderMultiColChunkFromLines(
   // gutter region between columns c and c+1, with a small top/bottom inset
   // so it doesn't visually bleed into the padding rows.
   //
-  // Cost: ~1568 px × 1 byte = 1568 bytes of identical mid-gray. After DEFLATE
-  // this is ~3-5 bytes; per-pixel token cost is β·1568 ≈ 2 tokens for the
-  // entire divider at the current measured β. Trivial vs the OCR-clarity win.
+  // Cost: ~1928 px × 1 byte of identical mid-gray. After DEFLATE this is
+  // ~3-5 bytes; per-pixel token cost is β·1928 ≈ 2 tokens for the entire
+  // divider at the current measured β. Trivial vs the OCR-clarity win.
   if (numCols >= 2) {
     const gutterPxPerSide = GUTTER_CELLS * CELL_W;
     const yStart = GUTTER_DIVIDER_INSET_PX;
