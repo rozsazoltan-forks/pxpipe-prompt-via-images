@@ -74,13 +74,14 @@ describe('public library API', () => {
     }
   });
 
-  it('recognizes the full GPT-5 family for OpenAI chat support', () => {
-    expect(isPxpipeSupportedGptModel('gpt-5')).toBe(true);
-    expect(isPxpipeSupportedGptModel('gpt-5.5')).toBe(true);
-    expect(isPxpipeSupportedGptModel('gpt-5.5-codex')).toBe(true);
-    expect(isPxpipeSupportedGptModel('gpt-5.5-2026-06-01')).toBe(true);
+  it('recognizes GPT 5.6 as the default OpenAI imaging scope (5.5 opt-in)', () => {
+    expect(isPxpipeSupportedGptModel('gpt-5')).toBe(false);
+    // gpt-5.5 degrades on imaged context, so it is off by default now.
+    expect(isPxpipeSupportedGptModel('gpt-5.5')).toBe(false);
+    expect(isPxpipeSupportedGptModel('gpt-5.5-codex')).toBe(false);
+    expect(isPxpipeSupportedGptModel('gpt-5.5-2026-06-01')).toBe(false);
     expect(isPxpipeSupportedGptModel('gpt-5.6')).toBe(true);
-    expect(isPxpipeSupportedGptModel('gpt-5-mini')).toBe(true);
+    expect(isPxpipeSupportedGptModel('gpt-5-mini')).toBe(false);
     expect(isPxpipeSupportedGptModel('gpt-5.6-nano')).toBe(true);
     expect(isPxpipeSupportedGptModel('gpt-5.6[1m]')).toBe(true);
     expect(isPxpipeSupportedGptModel('gpt-4o')).toBe(false);
@@ -88,6 +89,30 @@ describe('public library API', () => {
     expect(isPxpipeSupportedGptModel('')).toBe(false);
     expect(isPxpipeSupportedGptModel('claude-opus-4-8')).toBe(false);
     expect(isPxpipeSupportedGptModel(null)).toBe(false);
+  });
+
+  it('honors the single PXPIPE_MODELS scope for GPT families', () => {
+    const prev = process.env.PXPIPE_MODELS;
+    try {
+      // Explicit Claude-only scope disables GPT imaging.
+      process.env.PXPIPE_MODELS = 'claude-fable-5';
+      expect(isPxpipeSupportedGptModel('gpt-5.5')).toBe(false);
+      expect(isPxpipeSupportedGptModel('gpt-5.6')).toBe(false);
+
+      // Mixed CSV selects exactly those bases across families.
+      process.env.PXPIPE_MODELS = 'claude-fable-5,gpt-5.6';
+      expect(isPxpipeSupportedGptModel('gpt-5.5')).toBe(false);
+      expect(isPxpipeSupportedGptModel('gpt-5.6')).toBe(true);
+      expect(isPxpipeSupportedModel('claude-fable-5')).toBe(true);
+
+      // `off` disables everything.
+      process.env.PXPIPE_MODELS = 'off';
+      expect(isPxpipeSupportedGptModel('gpt-5.6')).toBe(false);
+      expect(isPxpipeSupportedModel('claude-fable-5')).toBe(false);
+    } finally {
+      if (prev === undefined) delete process.env.PXPIPE_MODELS;
+      else process.env.PXPIPE_MODELS = prev;
+    }
   });
 
   it('reports applicability with route/method/body gates', () => {
@@ -268,8 +293,9 @@ describe('public library API', () => {
     expect(firstUser.content[0].type).toBe('image_url');
     expect(firstUser.content[0].image_url.url).toMatch(/^data:image\/png;base64,/);
     expect(out.messages[0].content).toContain('rendered into image');
-    expect(out.tools[0].function.description).toBe('See rendered tool docs image.');
+    expect(out.tools[0].function.description).toBe('Read a file from disk. '.repeat(100));
     expect(out.tools[0].function.parameters.description).toBeUndefined();
     expect(out.tools[0].function.parameters.properties.path.description).toBeUndefined();
+    expect(JSON.stringify(out)).not.toContain('cache_control');
   });
 });

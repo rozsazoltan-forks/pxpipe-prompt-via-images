@@ -79,8 +79,11 @@ const MODEL_CATALOG: ReadonlyArray<{ id: string; label: string }> = [
   { id: 'claude-fable-5', label: 'Fable 5' },
   { id: 'claude-opus-4-8', label: 'Opus 4.8' },
   { id: 'claude-opus-4-7', label: 'Opus 4.7' },
-  { id: 'claude-sonnet-4-6', label: 'Sonnet 4.6' },
-  { id: 'claude-haiku-4-5', label: 'Haiku 4.5' },
+];
+
+const GPT_MODEL_CATALOG: ReadonlyArray<{ id: string; label: string }> = [
+  { id: 'gpt-5.6', label: 'GPT 5.6' },
+  { id: 'gpt-5.5', label: 'GPT 5.5' },
 ];
 
 export function renderModelsFragment(
@@ -89,32 +92,46 @@ export function renderModelsFragment(
   enabled: boolean,
 ): string {
   const on = new Set(active);
-  const labelOf = new Map(MODEL_CATALOG.map((m) => [m.id, m.label]));
+  const labelOf = new Map(
+    [...MODEL_CATALOG, ...GPT_MODEL_CATALOG].map((m) => [m.id, m.label]),
+  );
+  // Union the catalog with env-configured + active ids so PXPIPE_MODELS-enabled
+  // families always show as toggles, then split by family for the two sections.
   const ids: string[] = [];
   const seen = new Set<string>();
-  for (const id of [...MODEL_CATALOG.map((m) => m.id), ...configured, ...active]) {
+  for (const id of [
+    ...MODEL_CATALOG.map((m) => m.id),
+    ...GPT_MODEL_CATALOG.map((m) => m.id),
+    ...configured,
+    ...active,
+  ]) {
     if (id && !seen.has(id)) {
       seen.add(id);
       ids.push(id);
     }
   }
-  const chips = ids
-    .map((id) => {
-      const lit = on.has(id);
-      const label = labelOf.get(id) ?? id;
-      return (
-        `<button class="chip${lit ? ' on' : ''}" type="button" ` +
-        `hx-post="/fragments/models" hx-target="#frag-models" ` +
-        `hx-vals='{"model":"${id}","on":${!lit}}'>${escapeHtml(label)}${lit ? ' ✓' : ''}</button>`
-      );
-    })
-    .join('');
+  const chipFor = (id: string): string => {
+    const lit = on.has(id);
+    const label = labelOf.get(id) ?? id;
+    return (
+      `<button class="chip${lit ? ' on' : ''}" type="button" ` +
+      `hx-post="/fragments/models" hx-target="#frag-models" ` +
+      `hx-vals='{"model":"${id}","on":${!lit}}'>${escapeHtml(label)}${lit ? ' ✓' : ''}</button>`
+    );
+  };
+  const claudeChips = ids.filter((id) => !id.startsWith('gpt')).map(chipFor).join('');
+  const gptChips = ids.filter((id) => id.startsWith('gpt')).map(chipFor).join('');
   const moot = enabled ? '' : ` <span class="hint">compression is off, so this has no effect right now</span>`;
   return (
     `<div class="models">` +
-    `<span class="models-label">Only image these models</span>` +
-    chips +
-    `<span class="hint">everything else is sent as normal text · runtime only, not saved</span>${moot}` +
+    `<span class="models-label">Image Claude models</span>` +
+    claudeChips +
+    `<span class="hint">everything else is sent as normal text · runtime only · persist with PXPIPE_MODELS</span>${moot}` +
+    `</div>` +
+    `<div class="models">` +
+    `<span class="models-label">Image GPT models</span>` +
+    gptChips +
+    `<span class="hint">imaging only, no Anthropic cache_control · one scope for all families · set PXPIPE_MODELS (CSV of bases, or off) to persist</span>${moot}` +
     `</div>`
   );
 }
@@ -125,14 +142,19 @@ export function renderModelsFragment(
 const INPUT_USD_PER_MTOK = 10.0;
 void INPUT_USD_PER_MTOK; // suppress unused-var; renderHeaderFragment uses the server's pricing block.
 
-export function renderSessionSummaryFragment(data: CurrentSessionPayload): string {
-  const measured = data.baselineMeasuredCount ?? 0;
+// Lifetime hero. Reads the SAME cumulative weighted totals as the header strip
+// (serveStats), so the headline and the "$ saved" tiles can never disagree, and
+// the number stops swinging on tiny per-session samples. Cache-weighted on
+// purpose ("lifeweight"): it answers "did pxpipe move my real, cache-discounted
+// bill since this proxy started", not a raw token count.
+export function renderSessionSummaryFragment(s: StatsPayload): string {
+  const measured = s.compressed_requests ?? 0;
   if (measured <= 0) {
     return (
       `<div class="hero hero-empty">` +
-      `<div class="hero-eyebrow">This session</div>` +
+      `<div class="hero-eyebrow">Since start</div>` +
       `<div class="hero-headline">Warming up…</div>` +
-      `<div class="hero-sub">Point Claude Code at this proxy and send a message. The moment a request flows through, your live savings show up right here.</div>` +
+      `<div class="hero-sub">Point Claude Code at this proxy and send a message. The moment a request flows through, your running savings show up right here.</div>` +
       `</div>`
     );
   }
@@ -141,9 +163,10 @@ export function renderSessionSummaryFragment(data: CurrentSessionPayload): strin
   // cheap cache-reads (~0.1×), not full-price tokens. Weighting both sides at their
   // real cache rate is the only comparison that can't contradict the Saved column.
   // Input-only: pxpipe never touches output, so lumping it in just dampened the %.
-  const baselineW = data.baselineInputWeighted ?? 0; // same context as text, cache-aware
-  const actualW = data.actualInputWeighted ?? 0; // what we actually sent, cache-aware
-  const rawOutput = data.rawOutputTokens ?? 0; // reply — never compressed
+  const baselineW = s.baseline_input_weighted ?? 0; // same context as text, cache-aware
+  const actualW = s.actual_input_weighted ?? 0; // what we actually sent, cache-aware
+  const outMult = s.pricing_assumptions?.output_multiplier || 5;
+  const rawOutput = (s.output_weighted ?? 0) / outMult; // reply — never compressed
   const inputPct = baselineW > 0 ? (1 - actualW / baselineW) * 100 : 0;
   const positive = inputPct >= 0;
   const bigNum = `${Math.abs(inputPct).toFixed(0)}%`;
@@ -151,11 +174,11 @@ export function renderSessionSummaryFragment(data: CurrentSessionPayload): strin
 
   return (
     `<div class="hero${positive ? '' : ' hero-neg'}">` +
-    `<div class="hero-eyebrow">This session · ${measured} request${measured === 1 ? '' : 's'}</div>` +
+    `<div class="hero-eyebrow">Since start · ${numFmt(measured)} request${measured === 1 ? '' : 's'} imaged</div>` +
     `<div class="hero-headline"><span class="hero-num">${bigNum}</span> ${word} after caching</div>` +
     `<div class="hero-sub">` +
     `<strong>${kFmt(actualW)}</strong> effective tokens vs <strong>${kFmt(baselineW)}</strong> if this same context ` +
-    `stayed plain text — both counted after normal cache discounts. ` +
+    `stayed plain text — both counted after normal cache discounts since this proxy started. ` +
     `Your latest messages and Claude's live output are never compressed.` +
     `</div>` +
     `<div class="hero-meta">` +
@@ -438,7 +461,7 @@ export function renderRecentFragment(p: RecentPayload): string {
   const rows = (p.recent ?? []).slice().reverse();
   const body =
     rows.length === 0
-      ? `<tr><td colspan="9" class="empty-cell">No requests yet — they stream in here live.</td></tr>`
+      ? `<tr><td colspan="10" class="empty-cell">No requests yet — they stream in here live.</td></tr>`
       : rows
           .map((e: RecentRow, i: number) => {
             const viewId = (e.img_ids ?? (e.img_id != null ? [e.img_id] : []))[0];
@@ -455,6 +478,7 @@ export function renderRecentFragment(p: RecentPayload): string {
               `<td class="muted">${i + 1}</td>` +
               `<td><span class="pill pill-${statusCls(e.status)}">${e.status}</span></td>` +
               `<td class="endp">${escapeHtml(shortPath(e.path))}</td>` +
+              `<td>${e.model ? `<code>${escapeHtml(e.model)}</code>` : '<span class="muted">—</span>'}</td>` +
               `<td>${imaged}</td>` +
               `<td class="num">${e.cache_read != null ? numFmt(e.cache_read) : '—'}</td>` +
               `<td class="num">${e.baseline_input != null ? numFmt(e.baseline_input) : '—'}</td>` +
@@ -470,6 +494,7 @@ export function renderRecentFragment(p: RecentPayload): string {
     `<th>#</th>` +
     `<th>Result</th>` +
     `<th>Endpoint</th>` +
+    `<th>Model</th>` +
     `<th title="Was this request's context compressed into an image?">Sent as</th>` +
     `<th class="num" title="Tokens served from Claude's cache (cheap)">Cache hits</th>` +
     `<th class="num" title="What this context would cost as plain text">As text</th>` +
@@ -619,6 +644,21 @@ export function renderStatsTableFragment(p: FullStatsPayload): string {
 }
 
 // ---- page shell -------------------------------------------------------------
+
+// Favicon mirrors the .flame-dot glyph: a glossy flame sphere (radial highlight
+// at 35%/30%, --flame -> --flame-strong) ringed by a faint --flame-tint halo.
+// Inlined as a URL-encoded SVG data URI so the dashboard stays self-contained
+// (no extra route/static asset). Keep colors in sync with :root in CSS below.
+const FAVICON =
+  "data:image/svg+xml," +
+  "%3Csvg%20xmlns='http://www.w3.org/2000/svg'%20viewBox='0%200%2032%2032'%3E" +
+  "%3Cdefs%3E%3CradialGradient%20id='f'%20cx='35%25'%20cy='30%25'%20r='80%25'%3E" +
+  "%3Cstop%20offset='0%25'%20stop-color='%23ffd0a8'/%3E" +
+  "%3Cstop%20offset='55%25'%20stop-color='%23ff5a1f'/%3E" +
+  "%3Cstop%20offset='100%25'%20stop-color='%23e8420a'/%3E" +
+  "%3C/radialGradient%3E%3C/defs%3E" +
+  "%3Ccircle%20cx='16'%20cy='16'%20r='15.5'%20fill='%23fff1ea'/%3E" +
+  "%3Ccircle%20cx='16'%20cy='16'%20r='10'%20fill='url(%23f)'/%3E%3C/svg%3E";
 
 const CSS = `
   :root {
@@ -914,6 +954,7 @@ export function renderPage(port: number): string {
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1" />
 <title>pxpipe — live dashboard</title>
+<link rel="icon" href="${FAVICON}" />
 <style>${CSS}</style>
 </head>
 <body>

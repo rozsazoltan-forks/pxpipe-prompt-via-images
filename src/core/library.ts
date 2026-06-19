@@ -34,6 +34,7 @@ export type PxpipeReason =
   | 'unsupported_model'
   | 'parse_error'
   | 'below_min_chars'
+  | 'below_min_tokens'
   | 'not_profitable'
   | 'compress_disabled'
   | 'image_limit'
@@ -79,6 +80,7 @@ function classifyReason(info: TransformInfo): PxpipeReason {
   if (r.startsWith('parse_error')) return 'parse_error';
   if (r.startsWith('compress=false')) return 'compress_disabled';
   if (r.startsWith('below_min_chars')) return 'below_min_chars';
+  if (r.startsWith('below_min_tokens')) return 'below_min_tokens';
   if (r.startsWith('not_profitable')) return 'not_profitable';
   if (r.includes('image') && r.includes('limit')) return 'image_limit';
   return 'passthrough';

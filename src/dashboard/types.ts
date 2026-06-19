@@ -66,6 +66,7 @@ export interface RecentRow {
   ts: number;
   method: string;
   path: string;
+  model?: string;
   status: number;
   size_in?: number;
   compressed: boolean;

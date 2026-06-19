@@ -72,7 +72,68 @@ describe('proxy usage extraction', () => {
     expect(captured!.firstByteMs).toBeTypeOf('number');
   });
 
-  it('routes GPT 5.5 chat completions to OpenAI, transforms once, and normalizes usage', async () => {
+  it('transforms OpenCode /anthropic/messages (no /v1) and records the model', async () => {
+    const upstreamRequests: Request[] = [];
+    const restore = mockUpstream(async (req) => {
+      upstreamRequests.push(req.clone());
+      const url = req.url;
+      if (url.endsWith('/count_tokens')) {
+        return new Response(JSON.stringify({ input_tokens: 9000 }), {
+          status: 200,
+          headers: { 'content-type': 'application/json' },
+        });
+      }
+      return new Response(
+        JSON.stringify({
+          id: 'msg_1',
+          type: 'message',
+          role: 'assistant',
+          content: [{ type: 'text', text: 'hello' }],
+          usage: { input_tokens: 120, output_tokens: 7, cache_read_input_tokens: 0 },
+        }),
+        { status: 200, headers: { 'content-type': 'application/json' } },
+      );
+    });
+
+    let captured: ProxyEvent | undefined;
+    const proxy = createProxy({
+      upstream: 'http://ocproxy.test',
+      apiKey: 'sk-anthropic-test',
+      transform: { charsPerToken: 1, minCompressChars: 1 },
+      onRequest: (e) => {
+        captured = e;
+      },
+    });
+
+    const reqBody = JSON.stringify({
+      model: 'claude-fable-5',
+      max_tokens: 1,
+      system: 'System instruction. '.repeat(900),
+      messages: [{ role: 'user', content: 'hi' }],
+    });
+
+    const res = await proxy(
+      new Request('http://localhost/anthropic/messages', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json', 'x-api-key': 'sk-anthropic-test' },
+        body: reqBody,
+      }),
+    );
+    await res.text();
+    await new Promise((r) => setTimeout(r, 20));
+    restore();
+
+    const main = upstreamRequests.find((r) => r.url === 'http://ocproxy.test/anthropic/messages');
+    expect(main).toBeDefined();
+    expect(captured?.model).toBe('claude-fable-5');
+    expect(captured?.info?.compressed).toBe(true);
+    // count_tokens probe mirrors the request path under the same prefix.
+    expect(
+      upstreamRequests.some((r) => r.url === 'http://ocproxy.test/anthropic/messages/count_tokens'),
+    ).toBe(true);
+  });
+
+  it('routes GPT 5.6 chat completions to OpenAI, transforms once, and normalizes usage', async () => {
     const upstreamRequests: Request[] = [];
     const restore = mockUpstream(async (req) => {
       upstreamRequests.push(req.clone());
@@ -98,7 +159,7 @@ describe('proxy usage extraction', () => {
     });
 
     const reqBody = JSON.stringify({
-      model: 'gpt-5.5',
+      model: 'gpt-5.6',
       messages: [
         { role: 'system', content: 'System instruction. '.repeat(900) },
         { role: 'user', content: 'hi' },
@@ -135,6 +196,106 @@ describe('proxy usage extraction', () => {
     expect(captured!.usage?.input_tokens).toBe(55);
     expect(captured!.usage?.output_tokens).toBe(7);
     expect(captured!.info?.baselineProbeStatus).toBeUndefined();
+  });
+
+  it('transforms provider-prefixed OpenAI chat but forwards through the generic upstream', async () => {
+    const upstreamRequests: Request[] = [];
+    const restore = mockUpstream(async (req) => {
+      upstreamRequests.push(req.clone());
+      return new Response(
+        JSON.stringify({
+          id: 'chatcmpl_1',
+          object: 'chat.completion',
+          choices: [{ message: { role: 'assistant', content: 'hello' } }],
+          usage: { prompt_tokens: 55, completion_tokens: 7, total_tokens: 62 },
+        }),
+        { status: 200, headers: { 'content-type': 'application/json' } },
+      );
+    });
+
+    const proxy = createProxy({
+      upstream: 'http://ocproxy.test',
+      openAIUpstream: 'https://api.openai.test',
+      transform: { charsPerToken: 1, minCompressChars: 1 },
+    });
+
+    const reqBody = JSON.stringify({
+      model: 'gpt-5.6',
+      messages: [
+        { role: 'system', content: 'System instruction. '.repeat(900) },
+        { role: 'user', content: 'hi' },
+      ],
+    });
+
+    const res = await proxy(
+      new Request('http://localhost/openai/v1/chat/completions', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json', authorization: 'Bearer local-token' },
+        body: reqBody,
+      }),
+    );
+    await res.text();
+    restore();
+
+    expect(upstreamRequests).toHaveLength(1);
+    expect(upstreamRequests[0]!.url).toBe('http://ocproxy.test/openai/v1/chat/completions');
+    expect(upstreamRequests[0]!.headers.get('authorization')).toBe('Bearer local-token');
+    const sent = JSON.parse(await upstreamRequests[0]!.text()) as any;
+    const firstUser = sent.messages.find((m: any) => m.role === 'user');
+    expect(firstUser.content[0].type).toBe('image_url');
+  });
+
+  it('transforms OpenCode /openai/responses requests and records the model', async () => {
+    const upstreamRequests: Request[] = [];
+    const restore = mockUpstream(async (req) => {
+      upstreamRequests.push(req.clone());
+      return new Response(
+        JSON.stringify({
+          id: 'resp_1',
+          object: 'response',
+          output: [{ type: 'message', role: 'assistant', content: [{ type: 'output_text', text: 'hello' }] }],
+          usage: { input_tokens: 55, output_tokens: 7, total_tokens: 62 },
+        }),
+        { status: 200, headers: { 'content-type': 'application/json' } },
+      );
+    });
+
+    let captured: ProxyEvent | undefined;
+    const proxy = createProxy({
+      upstream: 'http://ocproxy.test',
+      openAIUpstream: 'https://api.openai.test',
+      transform: { charsPerToken: 1, minCompressChars: 1 },
+      onRequest: (e) => {
+        captured = e;
+      },
+    });
+
+    const reqBody = JSON.stringify({
+      model: 'gpt-5.6',
+      instructions: 'System instruction. '.repeat(900),
+      input: [{ role: 'user', content: 'hi' }],
+    });
+
+    const res = await proxy(
+      new Request('http://localhost/openai/responses', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json', authorization: 'Bearer local-token' },
+        body: reqBody,
+      }),
+    );
+    await res.text();
+    await new Promise((r) => setTimeout(r, 20));
+    restore();
+
+    expect(upstreamRequests).toHaveLength(1);
+    expect(upstreamRequests[0]!.url).toBe('http://ocproxy.test/openai/responses');
+    expect(upstreamRequests[0]!.headers.get('authorization')).toBe('Bearer local-token');
+    const sent = JSON.parse(await upstreamRequests[0]!.text()) as any;
+    const firstUser = sent.input.find((m: any) => m.role === 'user');
+    expect(firstUser.content[0].type).toBe('input_image');
+    expect(captured?.model).toBe('gpt-5.6');
+    expect(captured?.info?.compressed).toBe(true);
+    expect(captured?.info?.firstUserSha8).toMatch(/^[0-9a-f]{8}$/);
   });
 
   it('extracts usage tokens from an SSE stream (message_start event)', async () => {

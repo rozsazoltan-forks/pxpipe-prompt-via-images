@@ -24,19 +24,31 @@ function baseModelId(model: string): string {
 /** Dashboard runtime override; null = fall back to PXPIPE_MODELS env / built-in default. In-memory only. */
 let runtimeModelBases: readonly string[] | null = null;
 
-/** Resolution order (read per-call so scope flips LIVE):
- *  1. runtime override (dashboard chips) 2. PXPIPE_MODELS env 3. built-in default (Fable 5 only).
- *  Opus 4.8 is off by default: same pipeline but measurably worse at reading imaged content
- *  (FINDINGS.md 2026-06-16: ~2pp arithmetic, 6/15 dense-hex recall vs Fable's 100/100, 13/15) —
- *  silently compressing the operator's main model is the wrong default. Opt in via dashboard or PXPIPE_MODELS. */
-/** PXPIPE_MODELS env / built-in Fable-only default, ignoring the runtime override. */
+/** Built-in default scope when PXPIPE_MODELS is unset: Fable 5 (Claude) plus
+ *  GPT 5.6. GPT 5.5 and Opus 4.8 are intentionally off — same pipeline but
+ *  measurably worse at reading imaged content (FINDINGS.md 2026-06-16: Opus 4.8
+ *  ~2pp arithmetic, 6/15 dense-hex recall vs Fable's 100/100; GPT 5.5 likewise
+ *  degrades on imaged history/context) — so silently imaging them is the wrong
+ *  default. Both stay opt-in via the dashboard chips or PXPIPE_MODELS. */
+const DEFAULT_MODEL_BASES = ['claude-fable-5', 'gpt-5.6'];
+
+function falsey(v: string): boolean {
+  return /^(0|false|no|off|none)$/i.test(v.trim());
+}
+
+/** PXPIPE_MODELS env / built-in default, ignoring the runtime override. One CSV
+ *  controls every family (Claude + GPT). Resolution (read per-call so scope flips LIVE):
+ *  - unset or empty        → built-in default (Fable 5 + GPT 5.6)
+ *  - `off`/`0`/`false`/... → compress nothing
+ *  - CSV of model bases    → exactly those families (e.g. `claude-fable-5,gpt-5.6`) */
 function envOrDefaultBases(): string[] {
   // Edge-safe: `process` is undefined off-Node; `typeof` avoids a ReferenceError.
   const raw = typeof process !== 'undefined' ? process.env?.PXPIPE_MODELS : undefined;
-  return (raw && raw.trim() ? raw : 'claude-fable-5')
-    .split(',')
-    .map((s) => s.trim())
-    .filter(Boolean);
+  if (raw === undefined) return [...DEFAULT_MODEL_BASES];
+  const trimmed = raw.trim();
+  if (!trimmed) return [...DEFAULT_MODEL_BASES];
+  if (falsey(trimmed)) return [];
+  return trimmed.split(',').map((s) => s.trim()).filter(Boolean);
 }
 
 function allowedModelBases(): string[] {
@@ -44,7 +56,7 @@ function allowedModelBases(): string[] {
   return envOrDefaultBases();
 }
 
-/** Current effective allowed-model scope. */
+/** Current effective allowed-model scope (Claude + GPT). */
 export function getAllowedModelBases(): string[] {
   return allowedModelBases();
 }
@@ -60,19 +72,22 @@ export function setAllowedModelBases(list: readonly string[] | null): void {
   runtimeModelBases = list === null ? null : list.map((s) => s.trim()).filter(Boolean);
 }
 
-/** True when pxpipe may transform this model. Matches exact base or `-suffix` alias; [variant] tags stripped first. */
-export function isPxpipeSupportedModel(model: string | null | undefined): boolean {
+/** Membership test against the single allowed scope. Matches exact base or `-suffix`
+ *  alias; [variant] tags stripped first. */
+function isAllowed(model: string | null | undefined): boolean {
   if (typeof model !== 'string') return false;
   const base = baseModelId(model);
   return allowedModelBases().some((b) => base === b || base.startsWith(`${b}-`));
 }
 
-/** GPT-5 family (gpt-5, gpt-5.5, gpt-5.6, *-mini/-nano). Default-on: image OCR is
- *  validated for the 5.x family; older GPT-4.x vision is intentionally not enabled here. */
-const GPT5_FAMILY = /^gpt-5(?:\.\d+)?(?:-|$)/;
+/** True when pxpipe may transform this Anthropic model. */
+export function isPxpipeSupportedModel(model: string | null | undefined): boolean {
+  return isAllowed(model);
+}
+
+/** True when pxpipe may transform this GPT model. Shares the single PXPIPE_MODELS scope. */
 export function isPxpipeSupportedGptModel(model: string | null | undefined): boolean {
-  if (typeof model !== 'string') return false;
-  return GPT5_FAMILY.test(baseModelId(model));
+  return isAllowed(model);
 }
 
 export function shouldTransformAnthropicMessages(

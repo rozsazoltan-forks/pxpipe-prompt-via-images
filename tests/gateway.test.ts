@@ -170,3 +170,42 @@ describe('gateway end-to-end routing (stubbed fetch)', () => {
     expect(res.headers.get('content-type')).toBe('text/event-stream');
   });
 });
+
+describe('provider-prefixed passthrough routing', () => {
+  it('forwards non-Anthropic provider prefixes to the generic upstream', async () => {
+    const cap: { url?: string; headers?: Headers } = {};
+    stubFetch(cap);
+    await createProxy({
+      upstream: 'http://ocproxy.test',
+      openAIUpstream: 'http://openai.test',
+    })(
+      new Request('http://localhost/google-ai-studio/v1beta/models/gemini-2.5:generateContent?alt=sse', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json', authorization: 'Bearer local-token' },
+        body: JSON.stringify({ contents: [{ role: 'user', parts: [{ text: 'hi' }] }] }),
+      }),
+    );
+
+    expect(cap.url).toBe('http://ocproxy.test/google-ai-studio/v1beta/models/gemini-2.5:generateContent?alt=sse');
+    expect(cap.headers?.get('authorization')).toBe('Bearer local-token');
+  });
+
+  it('does not inject the Anthropic API key into non-Anthropic provider prefixes', async () => {
+    const cap: { url?: string; headers?: Headers } = {};
+    stubFetch(cap);
+    await createProxy({
+      upstream: 'http://ocproxy.test',
+      apiKey: 'sk-anthropic-test',
+    })(
+      new Request('http://localhost/compat/v1/chat/completions', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json', authorization: 'Bearer local-token' },
+        body: JSON.stringify({ model: '@cf/test/model', messages: [{ role: 'user', content: 'hi' }] }),
+      }),
+    );
+
+    expect(cap.url).toBe('http://ocproxy.test/compat/v1/chat/completions');
+    expect(cap.headers?.get('authorization')).toBe('Bearer local-token');
+    expect(cap.headers?.get('x-api-key')).toBeNull();
+  });
+});

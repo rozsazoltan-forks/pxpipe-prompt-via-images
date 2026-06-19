@@ -37,6 +37,12 @@ import {
   computeBaselineInputEff,
 } from './core/baseline.js';
 import {
+  computeOpenAIActualInputEff,
+  computeOpenAIBaselineInputEff,
+  computeOpenAIBaselineRawTokens,
+  openAIOutputRate,
+} from './core/openai-savings.js';
+import {
   aggregateSessions,
   claudeCodeMap,
   filterSessions,
@@ -61,7 +67,11 @@ import {
   renderStatsTableFragment,
   type ContextMapData,
 } from './dashboard/fragments.js';
-import { getAllowedModelBases, getConfiguredModelBases, setAllowedModelBases } from './core/applicability.js';
+import {
+  getAllowedModelBases,
+  getConfiguredModelBases,
+  setAllowedModelBases,
+} from './core/applicability.js';
 import type {
   StatsPayload,
   RecentPayload,
@@ -108,6 +118,7 @@ export interface RecentRow {
   ts: number;
   method: string;
   path: string;
+  model?: string;
   status: number;
   size_in?: number;
   compressed: boolean;
@@ -147,12 +158,16 @@ export interface RecentRow {
  *    Per event (see src/core/baseline.ts for the derivation):
  *      cacheable = baseline_cacheable_tokens || 0     (tokens up to last cache_control)
  *      cold_tail = baseline_tokens − cacheable        (always-cold input on both paths)
- *      cc_u, cr_u = the unproxied path's counterfactual cache_create / cache_read split:
- *                   cr > 0 ?  cc_u = min(cc, cacheable),  cr_u = cacheable − cc_u   (warm turn)
- *                 : cc > 0 ?  cc_u = cacheable,           cr_u = 0                  (cold start)
- *                 :           cc_u = 0,                   cr_u = 0                  (no caching)
- *      baseline_input_eff = cc_u × 1.25 + cr_u × 0.10
- *                         + (cacheable − cc_u − cr_u) × 1.0 + cold_tail × 1.0
+ *      warm      = did THIS request read a warm cache? (cache_read > 0)
+ *      The text counterfactual is WARMTH-AWARE and grounded in OBSERVED cache
+ *      state: pxpipe images the cached prefix in place (moves the caller's
+ *      cache_control marker onto the image), so image and text share cache fate.
+ *      cache_read>0 ⇒ a warm cache existed for both paths; cache_read===0 ⇒ cold
+ *      for both, so text re-creates its prefix too (no phantom warm read on a
+ *      cold turn — that would fabricate a loss out of a real token win):
+ *        warm:  baseline_input_eff = reused×0.10 + grown×1.25 + cold_tail×1.0
+ *               where reused = min(prevCacheable, cacheable), grown = cacheable − reused
+ *        cold:  baseline_input_eff = cacheable×1.25 + cold_tail×1.0
  *      actual_input_eff   = input + cache_create×1.25 + cache_read×0.10
  *      output_equiv       = output × 5                (input-token-equivalent at the 5× output rate)
  *      saved              = baseline_input_eff − actual_input_eff
@@ -329,6 +344,72 @@ const OUTPUT_TOKEN_RATE = 5.0;
 // understates the real bill - treat it as "input-side $ saved".
 export const ASSUMED_INPUT_USD_PER_MTOK = 10.0;
 
+/** Route per-event accounting by upstream. OpenAI paths use the GPT cost
+ *  model (vision-token imaging, automatic 0.1× prefix cache, no count_tokens
+ *  probe, 8× output); everything else uses the Anthropic cache-aware baseline.
+ *  Anthropic paths are `/v1/messages[/count_tokens]`; neither word appears. */
+function isOpenAIEvent(path: string | undefined): boolean {
+  if (!path) return false;
+  return path.includes('responses') || path.includes('chat/completions');
+}
+
+/** Cache-aware eff bundle for one GPT event. Shared by the live `update()`
+ *  and `replay()` paths so both read identical per-row numbers. Pure: takes
+ *  plain scalars (replay has no Usage/TransformInfo objects, only JSONL fields).
+ *
+ *  GPT differs from Anthropic on every axis: input_tokens already INCLUDES the
+ *  cached subset (`cachedTokens`), there is no cache-create premium, the cached
+ *  prefix reads at ~0.1×, and the baseline is the measured `baselineImagedTokens`
+ *  (o200k text-token cost of the imaged content) vs the vision-token `imageTokens`
+ *  pxpipe actually paid — not a count_tokens probe. No per-session warmth state:
+ *  OpenAI caching is automatic/prefix-based and the discount is already folded
+ *  into the cached-input rate. See src/core/openai-savings.ts. */
+function gptEff(args: {
+  model: string | undefined;
+  inputTokens: number;
+  outputTokens: number;
+  cachedTokens: number;
+  imageTokens: number;
+  baselineImagedTokens: number;
+  compressed: boolean;
+}): {
+  haveUsage: boolean;
+  haveBaseline: boolean;
+  creditSaving: boolean;
+  actualInputEff: number;
+  baselineInputEff: number;
+  outputEquiv: number;
+  rawActual: number;
+  rawBaseline: number;
+} {
+  const { model, inputTokens: inp, outputTokens: out, cachedTokens: cached } = args;
+  const { imageTokens, baselineImagedTokens, compressed } = args;
+  const haveUsage = inp > 0 || out > 0;
+  // The transform measured what the imaged content would have cost as o200k
+  // text; without it there is no counterfactual to credit.
+  const haveBaseline = baselineImagedTokens > 0;
+  const actualInputEff = haveUsage ? computeOpenAIActualInputEff(inp, cached, model) : 0;
+  const creditSaving = haveBaseline && haveUsage && compressed;
+  const baselineInputEff = creditSaving
+    ? computeOpenAIBaselineInputEff(inp, cached, imageTokens, baselineImagedTokens, model)
+    : actualInputEff;
+  const outputEquiv = haveUsage ? out * openAIOutputRate(model) : 0;
+  // Raw, rate-free token counts for the session's compression ratio and the
+  // Details panel: actual = what we sent; baseline = the text-only equivalent.
+  const rawActual = inp;
+  const rawBaseline = computeOpenAIBaselineRawTokens(inp, imageTokens, baselineImagedTokens);
+  return {
+    haveUsage,
+    haveBaseline,
+    creditSaving,
+    actualInputEff,
+    baselineInputEff,
+    outputEquiv,
+    rawActual,
+    rawBaseline,
+  };
+}
+
 export class DashboardState {
   private recent: RecentRow[] = [];
   /** Per-session dollar-weighted totals, keyed by `info.firstUserSha8`. The
@@ -341,6 +422,15 @@ export class DashboardState {
    *  ever carried a `firstUserSha8` (e.g. a cold start with only passthrough
    *  hits that the upstream probe never tagged). */
   private currentSessionId: string | null = null;
+  /** Per-session warmth for the cache-aware TEXT baseline: the wall-clock
+   *  second + cacheable-prefix size of each session's previous turn. A turn is
+   *  "warm" when <5min since the same session's last turn (Anthropic's cache
+   *  TTL), which decides whether the text counterfactual reads (0.10×) or
+   *  re-creates (1.25×) its prefix. Reconstructed identically in replay() from
+   *  persisted `ts`, so live and restored numbers agree. Capped with sessions. */
+  private baselineWarmth: Map<string, { ts: number; cacheable: number }> = new Map();
+  /** Anthropic prompt-cache TTL in seconds; a gap beyond this is a cold turn. */
+  private static readonly CACHE_TTL_SEC = 300;
   /** Hard cap on `sessions` Map entries. Keeps memory bounded in
    *  long-running deployments. 50 sessions × ~13 numeric fields each is
    *  comfortably under a MB even with fat bucket/passthrough histograms. */
@@ -477,46 +567,140 @@ export class DashboardState {
     const out = u?.output_tokens ?? 0;
     const cc = u?.cache_creation_input_tokens ?? 0;
     const cr = u?.cache_read_input_tokens ?? 0;
-    const haveUsage = u !== undefined && (inp > 0 || out > 0 || cc > 0 || cr > 0);
-    const baseline = info?.baselineTokens;
+    const gpt = isOpenAIEvent(ev.path);
 
-    // Honest gating: only attribute savings when BOTH baseline probes
-    // resolved (status === 'ok'). When the cacheable-prefix probe failed
-    // (status === 'partial') we previously fell through to cacheable=0,
-    // which silently charges the unproxied counterfactual the cold-input
-    // rate on tokens that actually would have been cache-discounted —
-    // fabricating "$ saved". Excluding the row is the only honest move
-    // until the probe succeeds.
-    const probeOk = info?.baselineProbeStatus === 'ok'
-      // Back-compat: hosts that haven't adopted baselineProbeStatus yet
-      // still see fields land; we accept legacy rows where the full-body
-      // probe resolved AND (either no markers existed OR cacheable did too).
-      || (info?.baselineProbeStatus === undefined && baseline !== undefined && baseline > 0);
-    const haveBaseline = typeof baseline === 'number' && baseline > 0 && probeOk;
+    // Unified per-row accounting, filled by the provider branch below. The
+    // downstream totals / per-session / recent-row code reads only these —
+    // it never re-derives cache math, so Anthropic and GPT can't drift.
+    let haveUsage: boolean;
+    let haveBaseline: boolean;
+    let creditSaving: boolean;
+    let actualInputEff: number;
+    let baselineInputEff: number;
+    let outputEquiv: number;
+    let rawActual: number; // raw tokens sent (session ratio + Details realInput)
+    let rawBaseline: number; // raw text-only counterfactual tokens
+    let baselineForRow: number; // baseline token count for contextHistory/recent
+    let cacheReadForRow: number; // tokens to surface in the "Cache hits" column
 
-    // Weighted INPUT cost we actually paid this turn.
-    const actualInputEff = haveUsage ? computeActualInputEff(inp, cc, cr) : 0;
+    if (gpt) {
+      // GPT cost model: no count_tokens probe, no cache-create premium, no
+      // per-session warmth — the discount is automatic and folded into the
+      // cached-input rate. Baseline is the measured imaged-vs-text delta.
+      const e = gptEff({
+        model: ev.model,
+        inputTokens: inp,
+        outputTokens: out,
+        cachedTokens: u?.cached_tokens ?? 0,
+        imageTokens: info?.imageTokens ?? 0,
+        baselineImagedTokens: info?.baselineImagedTokens ?? 0,
+        compressed,
+      });
+      haveUsage = e.haveUsage;
+      haveBaseline = e.haveBaseline;
+      creditSaving = e.creditSaving;
+      actualInputEff = e.actualInputEff;
+      baselineInputEff = e.baselineInputEff;
+      outputEquiv = e.outputEquiv;
+      rawActual = e.rawActual;
+      rawBaseline = e.rawBaseline;
+      baselineForRow = e.rawBaseline;
+      cacheReadForRow = u?.cached_tokens ?? 0;
+    } else {
+      haveUsage = u !== undefined && (inp > 0 || out > 0 || cc > 0 || cr > 0);
+      const baseline = info?.baselineTokens;
 
-    // Warmth-free, cache-aware baseline. The cached prefix is paid identically
-    // on both paths (it's already inside actualInputEff) and cancels; we credit
-    // only the net-new uncached text pxpipe compressed away — honest, NO >=0
-    // floor (a net-losing cc-heavy turn lowers it). No per-session warmth state
-    // — so live update() and replay() agree exactly.
-    // See src/core/baseline.ts for the derivation + the 2026-06-16 audit.
-    const cacheable = info?.baselineCacheableTokens ?? 0;
-    const baselineInputEff =
-      haveBaseline && haveUsage
-        ? computeBaselineInputEff(baseline as number, cacheable, inp, cc, cr)
-        : 0;
+      // Honest gating: only attribute savings when BOTH baseline probes
+      // resolved (status === 'ok'). When the cacheable-prefix probe failed
+      // (status === 'partial') we previously fell through to cacheable=0,
+      // which silently charges the unproxied counterfactual the cold-input
+      // rate on tokens that actually would have been cache-discounted —
+      // fabricating "$ saved". Excluding the row is the only honest move
+      // until the probe succeeds.
+      const probeOk = info?.baselineProbeStatus === 'ok'
+        // Back-compat: hosts that haven't adopted baselineProbeStatus yet
+        // still see fields land; we accept legacy rows where the full-body
+        // probe resolved AND (either no markers existed OR cacheable did too).
+        || (info?.baselineProbeStatus === undefined && baseline !== undefined && baseline > 0);
+      haveBaseline = typeof baseline === 'number' && baseline > 0 && probeOk;
 
-    // Output tokens are identical with/without compression — the proxy never
-    // touches the response body. They show up on BOTH sides of the savings
-    // ratio at their actual rate (OUTPUT_TOKEN_RATE × input rate) so the
-    // denominator reflects the full bill the user actually pays. Without
-    // this, an output-heavy turn would silently inflate the "saved %"
-    // headline relative to what Anthropic's weekly limit meters as token
-    // consumption (input + output × 5).
-    const outputEquiv = haveUsage ? out * OUTPUT_TOKEN_RATE : 0;
+      // Weighted INPUT cost we actually paid this turn.
+      actualInputEff = haveUsage ? computeActualInputEff(inp, cc, cr) : 0;
+
+      // pxpipe only reduces input by imaging the static slab. An UNCOMPRESSED
+      // row had its body forwarded untouched, so its unproxied counterfactual
+      // IS exactly what it paid — crediting the cache-modeled baseline there
+      // (which prices the prefix at the cache-READ rate) fabricates savings on
+      // passthrough traffic. Only credit the counterfactual when the row was
+      // actually compressed AND we have a usable probe.
+      creditSaving = haveBaseline && haveUsage && compressed;
+
+      // Warmth-free, cache-aware baseline. The cached prefix is paid identically
+      // on both paths (it's already inside actualInputEff) and cancels; we credit
+      // only the net-new uncached text pxpipe compressed away — honest, NO >=0
+      // floor (a net-losing cc-heavy turn lowers it). No per-session warmth state
+      // — so live update() and replay() agree exactly. Uncompressed rows fall
+      // back to actualInputEff so they contribute zero savings everywhere.
+      // See src/core/baseline.ts for the derivation + the 2026-06-16 audit.
+      const cacheable = info?.baselineCacheableTokens ?? 0;
+      // Cache-aware warmth: was this session's prefix warm (<TTL since its last
+      // turn)? Decides whether the text counterfactual reads or re-creates. Keyed
+      // by firstUserSha8; live uses the wall clock, replay() the persisted ts.
+      const sidNow = info?.firstUserSha8;
+      const nowSec = Date.now() / 1000;
+      const warmthPrev =
+        typeof sidNow === 'string' && sidNow.length > 0
+          ? this.baselineWarmth.get(sidNow)
+          : undefined;
+      // Observed cache state is ground truth. pxpipe moves the caller's
+      // cache_control marker onto the image (it never adds its own — see
+      // transform.ts), so the imaged prefix occupies the SAME cached position
+      // the text would: image and text share cache fate. cache_read>0 means a
+      // warm cache existed (text would have read it too); cache_read===0 means
+      // it was cold for BOTH paths. Pricing the text counterfactual warm on a
+      // cr=0 turn invents a discount we never observed and turns genuine token
+      // wins (image < text at the same cold create rate) into phantom losses.
+      // So warmth follows the observed read, not the wall clock alone.
+      const warm =
+        cr > 0 && warmthPrev !== undefined && nowSec - warmthPrev.ts < DashboardState.CACHE_TTL_SEC;
+      baselineInputEff = creditSaving
+        ? computeBaselineInputEff(
+            baseline as number,
+            cacheable,
+            inp,
+            cc,
+            cr,
+            warm,
+            warm ? warmthPrev!.cacheable : 0,
+          )
+        : actualInputEff;
+      // Record this turn's warmth footprint for the next turn in this session.
+      // Touch on every usage-bearing row (the cache is warmed regardless of
+      // compression); carry the prior cacheable when this row has no probe.
+      if (typeof sidNow === 'string' && sidNow.length > 0 && haveUsage) {
+        this.baselineWarmth.set(sidNow, {
+          ts: nowSec,
+          cacheable: cacheable > 0 ? cacheable : (warmthPrev?.cacheable ?? 0),
+        });
+        if (this.baselineWarmth.size > DashboardState.SESSION_CAP) {
+          const firstKey = this.baselineWarmth.keys().next().value;
+          if (firstKey !== undefined) this.baselineWarmth.delete(firstKey);
+        }
+      }
+
+      // Output tokens are identical with/without compression — the proxy never
+      // touches the response body. They show up on BOTH sides of the savings
+      // ratio at their actual rate (OUTPUT_TOKEN_RATE × input rate) so the
+      // denominator reflects the full bill the user actually pays. Without
+      // this, an output-heavy turn would silently inflate the "saved %"
+      // headline relative to what Anthropic's weekly limit meters as token
+      // consumption (input + output × 5).
+      outputEquiv = haveUsage ? out * OUTPUT_TOKEN_RATE : 0;
+      rawActual = inp + cc + cr;
+      rawBaseline = baseline ?? 0;
+      baselineForRow = baseline ?? 0;
+      cacheReadForRow = cr;
+    }
 
     // Record the request's transform breakdown for the Context Map panel. This
     // runs AFTER the eff-tokens are computed so the Details headline reads the
@@ -529,8 +713,8 @@ export class DashboardState {
       // (which carries that id) maps straight to this breakdown.
       this.contextHistory.push({
         id: imgId,
-        baselineTokens: baseline ?? 0,
-        realInput: inp + cc + cr,
+        baselineTokens: baselineForRow,
+        realInput: rawActual,
         baselineInputEff,
         actualInputEff,
         haveBaseline,
@@ -551,7 +735,10 @@ export class DashboardState {
     this.totals.requests += 1;
     if (compressed) this.totals.compressedRequests += 1;
 
-    if (haveBaseline && haveUsage) {
+    // Measured headline: only compressed rows with a usable probe. An
+    // uncompressed row contributes zero saved (baseline === actual), so
+    // including it here would only dilute the "saved on rows we moved" %.
+    if (creditSaving) {
       this.totals.baselineInputWeighted += baselineInputEff;
       this.totals.actualInputWeighted += actualInputEff;
       this.totals.outputWeighted += outputEquiv;
@@ -565,8 +752,9 @@ export class DashboardState {
     // keeps the ratio bounded at 100% — you can't save more than you
     // would have paid.
     if (haveUsage) {
-      this.totals.allBaselineEquivalentWeighted +=
-        haveBaseline ? baselineInputEff : actualInputEff;
+      // baselineInputEff already folds the uncompressed/probe-failed fallback
+      // to actualInputEff, so passthrough rows contribute zero saved here.
+      this.totals.allBaselineEquivalentWeighted += baselineInputEff;
       this.totals.allActualInputWeighted += actualInputEff;
       this.totals.allOutputWeighted += outputEquiv;
       this.totals.allUsageRequests += 1;
@@ -625,13 +813,13 @@ export class DashboardState {
       // update() so the lifetime totals block (above) and the per-session
       // block (here) read the same values. Re-deriving them here would
       // duplicate the cache-aware-baseline math and invite drift.
-      if (haveBaseline && haveUsage) {
+      if (creditSaving) {
         s.baselineInputWeighted += baselineInputEff;
         s.actualInputWeighted += actualInputEff;
         s.baselineMeasuredCount += 1;
         // RAW, rate-free compression: real tokens sent vs the same body as text.
-        s.rawActualTokens += inp + cc + cr;
-        s.rawBaselineTokens += baseline as number;
+        s.rawActualTokens += rawActual;
+        s.rawBaselineTokens += rawBaseline;
         s.rawOutputTokens += out; // not compressed; added to BOTH sides for the honest total
       }
       // ALL-rows session bill — mirrors the global `if (haveUsage)` block
@@ -661,17 +849,18 @@ export class DashboardState {
       ts: Date.now() / 1000,
       method: ev.method,
       path: ev.path,
+      model: ev.model,
       status: ev.status,
       compressed,
       cc_added: compressed ? 1 : undefined,
       input_tokens: haveUsage ? inp : undefined,
       output_tokens: haveUsage ? out : undefined,
       cache_create: haveUsage ? cc : undefined,
-      cache_read: haveUsage ? cr : undefined,
+      cache_read: haveUsage ? cacheReadForRow : undefined,
       actual_input: haveUsage ? round1(actualInputEff) : undefined,
-      baseline_input: haveBaseline && haveUsage ? round1(baselineInputEff) : undefined,
+      baseline_input: creditSaving ? round1(baselineInputEff) : undefined,
       session_saved_so_far_delta:
-        haveBaseline && haveUsage ? round1(baselineInputEff - actualInputEff) : undefined,
+        creditSaving ? round1(baselineInputEff - actualInputEff) : undefined,
       img_id: imgId,
       img_ids: imgIds,
     };
@@ -710,24 +899,93 @@ export class DashboardState {
       const out = t.output_tokens ?? 0;
       const cc = t.cache_create_tokens ?? 0;
       const cr = t.cache_read_tokens ?? 0;
-      const haveUsage = inp > 0 || out > 0 || cc > 0 || cr > 0;
-      const baseline = (t as { baseline_tokens?: number }).baseline_tokens;
-      const cacheable = (t as { baseline_cacheable_tokens?: number })
-        .baseline_cacheable_tokens ?? 0;
-      const probeStatus = (t as { baseline_probe_status?: string }).baseline_probe_status;
-      // Same gating rule as update(): require an explicit 'ok' status when
-      // present; fall back to "have a baseline number" for legacy JSONL.
-      const probeOk = probeStatus === 'ok'
-        || (probeStatus === undefined && typeof baseline === 'number' && baseline > 0);
-      const haveBaseline = typeof baseline === 'number' && baseline > 0 && probeOk;
-      const actualInputEff = haveUsage ? computeActualInputEff(inp, cc, cr) : 0;
-      const baselineInputEff =
-        haveBaseline && haveUsage
-          ? computeBaselineInputEff(baseline as number, cacheable, inp, cc, cr)
-          : 0;
-      // Output tokens land in the row for the table; totals are not
-      // restored on replay (see header comment on cumulative totals).
       const compressed = t.compressed === true;
+      const gpt = isOpenAIEvent(t.path);
+
+      // Same unified accounting as update(); see the branch comments there.
+      let haveUsage: boolean;
+      let haveBaseline: boolean;
+      let creditSaving: boolean;
+      let actualInputEff: number;
+      let baselineInputEff: number;
+      let rawActual: number;
+      let rawBaseline: number;
+      let baselineForRow: number;
+      let cacheReadForRow: number;
+
+      if (gpt) {
+        const e = gptEff({
+          model: t.model,
+          inputTokens: inp,
+          outputTokens: out,
+          cachedTokens: (t as { cached_tokens?: number }).cached_tokens ?? 0,
+          imageTokens: (t as { image_tokens?: number }).image_tokens ?? 0,
+          baselineImagedTokens:
+            (t as { baseline_imaged_tokens?: number }).baseline_imaged_tokens ?? 0,
+          compressed,
+        });
+        haveUsage = e.haveUsage;
+        haveBaseline = e.haveBaseline;
+        creditSaving = e.creditSaving;
+        actualInputEff = e.actualInputEff;
+        baselineInputEff = e.baselineInputEff;
+        rawActual = e.rawActual;
+        rawBaseline = e.rawBaseline;
+        baselineForRow = e.rawBaseline;
+        cacheReadForRow = (t as { cached_tokens?: number }).cached_tokens ?? 0;
+      } else {
+        haveUsage = inp > 0 || out > 0 || cc > 0 || cr > 0;
+        const baseline = (t as { baseline_tokens?: number }).baseline_tokens;
+        const cacheable = (t as { baseline_cacheable_tokens?: number })
+          .baseline_cacheable_tokens ?? 0;
+        const probeStatus = (t as { baseline_probe_status?: string }).baseline_probe_status;
+        // Same gating rule as update(): require an explicit 'ok' status when
+        // present; fall back to "have a baseline number" for legacy JSONL.
+        const probeOk = probeStatus === 'ok'
+          || (probeStatus === undefined && typeof baseline === 'number' && baseline > 0);
+        haveBaseline = typeof baseline === 'number' && baseline > 0 && probeOk;
+        actualInputEff = haveUsage ? computeActualInputEff(inp, cc, cr) : 0;
+        // Mirror update(): only credit the cache-modeled counterfactual on
+        // compressed rows. Uncompressed/passthrough rows fall back to the
+        // actual cost so they show zero saved (no fabricated savings).
+        creditSaving = haveBaseline && haveUsage && compressed;
+        // Cache-aware warmth, reconstructed from persisted ts so replay matches
+        // the live update() path (see baselineWarmth field + update()).
+        const sidR = (t as { first_user_sha8?: string }).first_user_sha8;
+        const tsSec = Date.parse(t.ts) / 1000;
+        const warmthPrevR =
+          typeof sidR === 'string' && sidR.length > 0 ? this.baselineWarmth.get(sidR) : undefined;
+        // Same cr-grounded warmth as update() — see the note there. cr>0 ⇒ the
+        // imaged prefix read a warm cache, so the text counterfactual would have
+        // too; cr===0 ⇒ cold for both, price text cold (never warm-vs-cold).
+        const warmR =
+          cr > 0 && warmthPrevR !== undefined && tsSec - warmthPrevR.ts < DashboardState.CACHE_TTL_SEC;
+        baselineInputEff = creditSaving
+          ? computeBaselineInputEff(
+              baseline as number,
+              cacheable,
+              inp,
+              cc,
+              cr,
+              warmR,
+              warmR ? warmthPrevR!.cacheable : 0,
+            )
+          : actualInputEff;
+        if (typeof sidR === 'string' && sidR.length > 0 && haveUsage) {
+          this.baselineWarmth.set(sidR, {
+            ts: tsSec,
+            cacheable: cacheable > 0 ? cacheable : (warmthPrevR?.cacheable ?? 0),
+          });
+          if (this.baselineWarmth.size > DashboardState.SESSION_CAP) {
+            const firstKey = this.baselineWarmth.keys().next().value;
+            if (firstKey !== undefined) this.baselineWarmth.delete(firstKey);
+          }
+        }
+        rawActual = inp + cc + cr;
+        rawBaseline = baseline ?? 0;
+        baselineForRow = baseline ?? 0;
+        cacheReadForRow = cr;
+      }
       // Rebuild the Context Map breakdown so old rows keep their "Saved" value
       // and "Details" link after a restart. The PNG ring is in-memory and gone,
       // so thumbnails can't return (imageIds: [], flagged `restored`) — but the
@@ -735,12 +993,12 @@ export class DashboardState {
       // event with the same cache-weighted math as the live update() path.
       const imageCount = (t as { image_count?: number }).image_count ?? 0;
       let imgId: number | undefined;
-      if (compressed && haveUsage && (imageCount > 0 || typeof baseline === 'number')) {
+      if (compressed && haveUsage && (imageCount > 0 || rawBaseline > 0)) {
         imgId = this.nextImageId++;
         this.contextHistory.push({
           id: imgId,
-          baselineTokens: baseline ?? 0,
-          realInput: inp + cc + cr,
+          baselineTokens: baselineForRow,
+          realInput: rawActual,
           baselineInputEff,
           actualInputEff,
           haveBaseline,
@@ -759,18 +1017,19 @@ export class DashboardState {
         ts: Date.parse(t.ts) / 1000,
         method: t.method,
         path: t.path,
+        model: t.model,
         status: t.status,
         compressed,
         cc_added: compressed ? 1 : undefined,
         input_tokens: t.input_tokens,
         output_tokens: t.output_tokens,
         cache_create: t.cache_create_tokens,
-        cache_read: t.cache_read_tokens,
+        cache_read: gpt ? cacheReadForRow : t.cache_read_tokens,
         actual_input: haveUsage ? round1(actualInputEff) : undefined,
         baseline_input:
-          haveBaseline && haveUsage ? round1(baselineInputEff) : undefined,
+          creditSaving ? round1(baselineInputEff) : undefined,
         session_saved_so_far_delta:
-          haveBaseline && haveUsage ? round1(baselineInputEff - actualInputEff) : undefined,
+          creditSaving ? round1(baselineInputEff - actualInputEff) : undefined,
         img_id: imgId,
         img_ids: imgId !== undefined ? [imgId] : undefined,
       };
@@ -1043,7 +1302,11 @@ export class DashboardState {
         return htmlResponse(renderToggleFragment(this.compressionEnabled));
       case 'models':
         return htmlResponse(
-          renderModelsFragment(getAllowedModelBases(), getConfiguredModelBases(), this.compressionEnabled),
+          renderModelsFragment(
+            getAllowedModelBases(),
+            getConfiguredModelBases(),
+            this.compressionEnabled,
+          ),
         );
       case 'context-map': {
         const reqParam = url.searchParams.get('req');
@@ -1060,8 +1323,10 @@ export class DashboardState {
         );
       }
       case 'session-summary': {
-        const cur = (await this.serveCurrentSessionJson().json()) as CurrentSessionPayload;
-        return htmlResponse(renderSessionSummaryFragment(cur));
+        // Lifetime hero — same cumulative payload as the header strip so the
+        // headline and the "$ saved" tiles never disagree and it stops jumping.
+        const s = (await this.serveStats().json()) as StatsPayload;
+        return htmlResponse(renderSessionSummaryFragment(s));
       }
       case 'header': {
         const s = (await this.serveStats().json()) as StatsPayload;
@@ -1153,9 +1418,9 @@ export class DashboardState {
     return jsonResponse({ compression_enabled: on });
   }
 
-  /** POST /fragments/models — add/remove ONE model from the runtime compress
-   *  scope. In-memory only; restart resets to the PXPIPE_MODELS env / Fable-only
-   *  default. The model check (`isPxpipeSupportedModel`) reads this live. */
+  /** POST /fragments/models — add/remove ONE model (Claude or GPT) from the
+   *  runtime compress scope. In-memory only; restart resets to the PXPIPE_MODELS
+   *  env / built-in default. The model checks read this live. */
   handleModelsToggle(model: string, on: boolean): void {
     const next = new Set(getAllowedModelBases());
     if (on) next.add(model);

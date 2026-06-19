@@ -79,4 +79,31 @@ describe('restart restore (replay)', () => {
     const recent = (await dash.serveRecent().json()) as { recent: Array<Record<string, unknown>> };
     expect(recent.recent[0]!.img_id).toBeUndefined();
   });
+
+  it('credits zero saved on an uncompressed row even when a probe baseline landed', async () => {
+    // Provider-prefixed routes (e.g. /anthropic/messages) now run the
+    // count_tokens probe, so a passthrough row can carry baseline_tokens.
+    // The unproxied counterfactual for an untouched body IS what it paid —
+    // crediting the cache-modeled baseline here would fabricate savings.
+    tmp = makeTmp();
+    writeEvents(tmp, [
+      ev({
+        compressed: false,
+        input_tokens: 100,
+        cache_read_tokens: 5000,
+        output_tokens: 139,
+        baseline_tokens: 6000,
+        baseline_cacheable_tokens: 5000,
+        baseline_probe_status: 'ok',
+      }),
+    ]);
+    const dash = new DashboardState(tmp, async () => new Map());
+    await dash.replay(tmp.eventsFile);
+
+    const recent = (await dash.serveRecent().json()) as { recent: Array<Record<string, unknown>> };
+    const row = recent.recent[0]!;
+    // No baseline column, no Saved delta — pxpipe didn't move this bill.
+    expect(row.baseline_input).toBeUndefined();
+    expect(row.session_saved_so_far_delta).toBeUndefined();
+  });
 });

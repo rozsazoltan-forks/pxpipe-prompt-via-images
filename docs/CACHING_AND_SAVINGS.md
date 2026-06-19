@@ -264,44 +264,95 @@ Anthropic actually charged.
 
 ### 2.4 The counterfactual side — `computeBaselineInputEff`
 
-This is the subtle part. We have to reconstruct what the **unproxied** request
-would have been billed *against an unproxied cache that had been built up
-turn-by-turn the same way*. We infer its cache class from the proxied request's
-observed `cc`/`cr`:
+This is the subtle part. We reconstruct what the **unproxied** (text) request
+would have been billed *against a text cache built up turn-by-turn the same way*.
+The realization that drives the whole function: **a text prefix is only a cheap
+cache-read when a warm cache actually existed this turn.** Pricing the cacheable
+prefix at the read rate unconditionally fabricates a "free read" on
+cold/TTL-expiry turns — turns where the text path would in fact pay the 1.25×
+*create*, exactly as the imaged path does. That phantom read lands as a fake
+pxpipe *loss* on cold/growth turns.
+
+So the baseline is **warmth-aware**, and warmth is grounded in the **observed
+read**, not a wall-clock guess. A turn is **warm** only when the proxied request
+**actually read a warm cache** (`cache_read > 0`) *and* the same session had a
+usage-bearing turn **less than `CACHE_TTL_SEC` (300s) ago**; otherwise it's
+**cold** (first turn, a >5-min gap that let Anthropic's entry expire, **or a cache
+MISS inside the window** — `cache_read = 0`). The wall clock is *necessary but not
+sufficient*: a stale prefix can't be read, but being inside the window doesn't
+prove one was. The image and text counterfactuals **share one cache slot** —
+pxpipe only relocates the caller's existing `cache_control` marker onto the last
+image, never adds its own — so if the imaged request missed (`cr = 0`), the text
+path was cold too. Pricing it warm would invent a discount we never observed.
 
 ```
 cacheable = min(baselineCacheable, baseline)   // the would-have-cached prefix
 coldTail  = baseline − cacheable               // always-cold tail (both paths)
 ```
 
-Then split `cacheable` into create/read/cold buckets by the turn's cache class:
+Then price `cacheable` by warmth:
 
-| case | condition | `ccU` (created) | `crU` (read warm) |
-|---|---|---|---|
-| **warm turn** | `cr > 0` | `min(cc, cacheable)` | `cacheable − ccU` |
-| **cold start** | `cr == 0, cc > 0` | `cacheable` | `0` |
-| **no caching** | `cc == 0, cr == 0` | `0` | `0` (whole body at 1.0×) |
+| case | condition | how the text path is billed |
+|---|---|---|
+| **cold turn** | first turn, >300s since last turn, **or `cr = 0` (a miss inside the window)** | `cacheable × 1.25  +  coldTail × 1.0` |
+| **warm turn** | `cr > 0` **and** <300s since this session's last turn | `reused × 0.10  +  grown × 1.25  +  coldTail × 1.0` |
+
+where, on a warm turn:
 
 ```
-baseline_eff = ccU × 1.25
-             + crU × 0.10
-             + (cacheable − ccU − crU) × 1.0   // any cacheable remainder, cold
-             + coldTail × 1.0
+reused = min(prevCacheable, cacheable)   // prefix carried from last turn → read at 0.10×
+grown  = cacheable − reused              // net-new cacheable bytes this turn → created at 1.25×
 ```
 
-The key modeling assumption (warm case): the proxied path's `cc` bucket is
-**approximately the new per-turn tail** — the user-typed content this turn, which
-pxpipe **does not compress**. That same tail exists byte-for-byte on the
-unproxied path, so the unproxied path pays *roughly the same absolute `cc`* at
-1.25×, and reads the rest of its (larger) cacheable prefix at 0.10×.
+`prevCacheable` is the cacheable-prefix size on the **same session's previous
+turn**. A growth turn (the conversation got longer) reads the part it already had
+and creates only the delta; a shrink turn caps `reused` at the current
+`cacheable` so `grown = 0`. This is what the **text** path pays *regardless of
+what pxpipe's image cache did* — if the image prefix grew and busted its own
+entry this turn, that real loss stays on the actual side; the baseline doesn't
+hide it by also charging the text path a create it never would have paid.
 
-> **Why this rewrite was necessary.** An earlier, naive baseline collapsed the
-> whole counterfactual into one cache weight (`cr>0 ? 0.1 : cc>0 ? 1.25 : 1.0`).
-> On any warm turn with mixed `cc`/`cr` it attributed 100% of the unproxied
-> prefix to `cr × 0.1`, making the unproxied path look 12.5× too cheap and pxpipe
-> look like it *lost money*. The 7-event May-2026 regression went from −9,786
-> "saved" tokens (pre-fix) to +19,452 (post-fix). Don't revert to a single-weight
-> baseline.
+> **Signature note.**
+> `computeBaselineInputEff(baseline, baselineCacheable, inputTokens, cc, cr, warm, prevCacheable)`.
+> The `warm` flag handed in is itself **cr-grounded** at every call site
+> (`warm = cr > 0 && <300s`), so the proxied request's observed cache buckets now
+> *gate* the split — a turn that missed (`cr = 0`) is priced cold no matter how
+> recent the last turn was. Once warm, the magnitude of the read is driven by
+> `prevCacheable` (how much prefix carried over), not by the raw `cr` count.
+
+Two guard rails short-circuit before the warmth split:
+
+- `baseline ≤ 0` → return `0` (nothing to compare).
+- `baselineCacheable ≤ 0` (no markers in the body, or the cacheable probe failed)
+  → we can't split prefix from tail, so we **credit nothing**: return
+  `computeActualInputEff(...)`, making savings for that turn exactly `0` rather
+  than a guess.
+
+> **Audit history — this has been wrong three times; don't make it four.**
+> 1. The *first* baseline collapsed the whole counterfactual into one cache
+>    weight (`cr>0 ? 0.1 : cc>0 ? 1.25 : 1.0`). On a warm turn with mixed
+>    `cc`/`cr` it priced 100% of the unproxied prefix at `0.1×`, making the
+>    unproxied path look 12.5× too cheap and pxpipe look like it *lost money*
+>    (a 7-event May-2026 sample swung from −9,786 "saved" to +19,452 once the
+>    prefix was split from the tail).
+> 2. The split version was still **warmth-free** — it always read the cacheable
+>    prefix at `0.1×`. That fabricated the "free read" above, resurfacing a
+>    phantom loss on cold/TTL-expiry turns where text really pays the create.
+> 3. The warmth fix in (2) then keyed `warm` on the **wall clock alone** — any
+>    turn <300s after its predecessor was priced warm, *even when the proxied
+>    request actually missed the cache* (`cr = 0`). So a cold miss inside the
+>    window was handed the 0.1× read it never got, while the imaged request paid
+>    the full cold create — pricing the two sides on opposite cache states. On a
+>    real 187k-token body imaged to 80k, that flipped a genuine **+134k saved**
+>    into a **−79k "loss"** the table hid as `—`. Fixed by grounding warmth in
+>    the observed read: `warm = cr > 0 && <300s`. If the image was cold, the text
+>    is cold too — they share one cache slot.
+>
+> The current model does all three: split the prefix, gate the read rate on real
+> warmth, **and** require an observed warm read (`cr > 0`) before pricing text
+> warm. `tests/baseline.test.ts` locks `cold(prefix) > warm(prefix)`, and the
+> dashboard/sessions replay tests lock the cold-miss-within-TTL case, so none of
+> the three regressions can creep back.
 
 ### 2.5 Savings = the difference (caching already cancelled)
 
@@ -317,43 +368,65 @@ output ×5` — and since those weights are applied identically on both arms, th
 caching discount and the output cost both cancel out of the *difference*. What's
 left is purely the text→image token reduction.
 
-### 2.6 Worked example (a warm turn)
+### 2.6 Worked example — same body, warm vs cold
 
-Say a mid-session turn looks like this:
+Take one body two ways. **30,000 tokens**, of which **28,000** are the cacheable
+prefix (`baseline = 30000`, `baselineCacheable = 28000`), so `coldTail = 2000`.
+pxpipe images that prefix down to ~3,000 image tokens.
 
-- Original body: **30,000 tokens**, of which **28,000** are the cacheable prefix
-  (`baseline = 30000`, `baselineCacheable = 28000`), so `coldTail = 2000`.
-- pxpipe images that prefix down to ~3,000 image tokens. The real response bills
-  `input_tokens = 2000`, `cc = 1000`, `cr = 3000`.
-
-**Counterfactual (unproxied), warm case** (`cr > 0`):
-
-```
-cacheable = 28000,  coldTail = 2000
-ccU = min(cc, cacheable) = min(1000, 28000) = 1000
-crU = 28000 − 1000 = 27000
-baseline_eff = 1000×1.25 + 27000×0.10 + 0×1.0 + 2000×1.0
-             = 1250 + 2700 + 0 + 2000
-             = 5,950 token-equivalents
-```
-
-**Proxied (actual):**
+**(a) Mid-session warm turn.** The previous turn cached a 27,000-token prefix
+(`prevCacheable = 27000`), so the prefix grew 1,000 this turn. The real response
+bills `input_tokens = 2000`, `cc = 1000`, `cr = 3000`.
 
 ```
-actual_eff = 2000 + 1000×1.25 + 3000×0.10
-           = 2000 + 1250 + 300
-           = 3,550 token-equivalents
+Counterfactual (text, warm):
+  reused = min(27000, 28000) = 27000
+  grown  = 28000 − 27000     = 1000
+  baseline_eff = 27000×0.10 + 1000×1.25 + 2000×1.0
+               = 2700 + 1250 + 2000 = 5,950
+
+Proxied (actual):
+  actual_eff = 2000 + 1000×1.25 + 3000×0.10
+             = 2000 + 1250 + 300 = 3,550
+
+Savings = 5950 − 3550 = 2,400 token-equivalents (~40%)
 ```
 
-**Savings this turn:** `5950 − 3550 = 2,400` token-equivalents (~40%).
+The `grown × 1.25` term (1,250) is the same net-new content both paths must
+create — it cancels against the actual `cc` term. The win is that the proxied arm
+reads **3,000 image tokens** at 0.1× where the text arm reads **27,000** — 9×
+fewer tokens sitting under the same discount. That reduction, not the cache
+discount, is what pxpipe is credited with.
 
-Notice the `cc` term is **1,250 on both sides** — the same new tail, the same
-1.25× write, it cancels in the subtraction and contributes nothing to savings.
-And the cache *discount* applies to both: the unproxied path reads 27,000 text
-tokens at 0.1× (= 2,700), the proxied path reads 3,000 image tokens at 0.1×
-(= 300). Caching helped both arms; the win is that the proxied arm has **9× fewer
-tokens sitting under that same discount**. That — not the cache discount — is
-what pxpipe is credited with.
+**(b) Cold turn (first turn, a >5-min idle, or a miss inside the window).** Same
+body, but no warm cache for either path. The imaged request creates its
+~3,000-token image prefix cold: `input_tokens = 2000`, `cc = 3000`, `cr = 0`. The
+`cr = 0` is the tell — even if this turn landed <300s after the last one, a miss
+means the prefix wasn't actually served warm, so both sides are priced cold.
+
+```
+Counterfactual (text, cold):
+  baseline_eff = 28000×1.25 + 2000×1.0
+               = 35000 + 2000 = 37,000
+
+Proxied (actual):
+  actual_eff = 2000 + 3000×1.25 + 0
+             = 2000 + 3750 = 5,750
+
+Savings = 37000 − 5750 = 31,250 token-equivalents
+```
+
+The cold turn is pxpipe's biggest win: the text path eats a full `28000×1.25`
+create; the image path eats only `3000×1.25`.
+
+> This cold case is exactly what the earlier baselines got wrong — twice. The
+> **warmth-free** version always read the prefix at `28000×0.10 = 2,800` →
+> `baseline_eff = 4,800`, then subtracted the real `actual_eff = 5,750` for a
+> **−950 "loss"** on a turn that actually saved 31,250. The **wall-clock-warm**
+> version repeated it for any cold *miss* inside the 300s window (`cr = 0` but
+> <300s since the last turn): it still handed the text path the 0.1× read the
+> imaged request never got. Grounding warmth in `cr > 0` is what keeps both sides
+> cold here and turns the phantom loss back into the real number.
 
 ---
 
@@ -366,26 +439,45 @@ Every row in `~/.pxpipe/events.jsonl` carries both arms of the same request.
 - `baseline_tokens` — `count_tokens` on the original body (full counterfactual)
 - `baseline_cacheable_tokens` — `count_tokens` truncated at the last
   `cache_control` marker (omitted/`0` if the body had no markers)
+- `first_user_sha8` — the **session key**. Rows sharing this value are the same
+  conversation; warmth is derived from the time gap between consecutive rows that
+  share it.
 - the billed `input_tokens`, `cache_create_tokens` (← Anthropic's
   `cache_creation_input_tokens`), and `cache_read_tokens` (← Anthropic's
   `cache_read_input_tokens`) from the real response. (A 1-hour cache tier, if
   ever used, splits out as `cache_create_5m_tokens` / `cache_create_1h_tokens`.)
 
-Feed those four numbers per row through `computeBaselineInputEff` and
+Because warmth is a **cross-turn** property, replay isn't purely per-row: group
+rows by `first_user_sha8`, sort each group by `ts`, then walk each session in
+time order. For each row, `warm = (ts − previous_in_session_ts) < 300s`, and
+`prevCacheable` is the previous in-session row's `baseline_cacheable_tokens`; the
+first row of a session (and any row >300s after its predecessor) is **cold** with
+`prevCacheable = 0`. Feed `(baseline_tokens, baseline_cacheable_tokens,
+input_tokens, cache_create_tokens, cache_read_tokens, warm, prevCacheable)`
+through `computeBaselineInputEff` and the billed triple through
 `computeActualInputEff` (both exported from `src/core/baseline.ts`), sum the
-differences, convert with the list ratios above, and you've re-derived the
-headline. The proxy, the live dashboard, and the JSONL replay all call the **same
-two functions** so the three views can't drift.
+per-row differences, convert with the list ratios above, and you've re-derived
+the headline. The live dashboard (`DashboardState`) and the JSONL replay both
+reconstruct warmth this same way — keyed by `first_user_sha8`, 300s TTL — and
+call the **same two functions**, so the views can't drift.
 
 ### Edge cases worth knowing
 
-- **No `cache_control` markers in the body** → `cacheable = 0`, so the entire
-  baseline is billed cold at 1.0× on both sides. (This is also what happens when
-  the cacheable-prefix probe fails; see the `partial`/`unmeasured` status flags
-  in `transform.ts` so a failed probe is recorded rather than silently treated as
-  `cacheable = 0`, which would bias savings downward.)
-- **Body below the 2048-token cacheable floor** → `cc == 0 && cr == 0`; the
-  marker is ignored by Anthropic and both paths pay the whole body at 1.0×.
+- **No `cache_control` markers in the body** (or the cacheable probe failed) →
+  `baselineCacheable ≤ 0`, so `computeBaselineInputEff` returns
+  `computeActualInputEff(...)` and the row contributes **exactly 0 savings** — we
+  refuse to invent a prefix we couldn't measure. The `partial`/`unmeasured`
+  status flags in `transform.ts` record a failed probe so it reads as a visible
+  zero rather than silently biasing the rollup.
+- **Uncompressed turns are credited 0.** A row pxpipe didn't compress (e.g. a
+  body below the min-chars gate) carries the cost-side gate `creditSaving =
+  haveBaseline && haveUsage && compressed`; when `compressed` is false the
+  baseline is forced to equal the actual, so passthrough turns can't manufacture
+  phantom savings.
+- **Cold turns cost more on the text side, by design.** The cold branch prices
+  the cacheable prefix at the 1.25× create rate, never the read rate — this is
+  the warmth fix, not a bug. `tests/baseline.test.ts` asserts
+  `cold(prefix) > warm(prefix)` for the same prefix.
 - **Output is never in this math.** It's identical on both arms and lives in its
   own accumulator.
 
@@ -401,9 +493,11 @@ tail stays outside the cached region. The one-time `cache_create` "burn" on the
 flip turn is charged to whichever side would force it, which pins the gate
 against mode-flapping; the history-collapse gate separately weighs image-vs-text
 cost over an expected reuse horizon. Savings are then measured by pricing
-**both** the real request and a
-`count_tokens` counterfactual of the original body with the **same** cache rates
-(create 1.25×, read 0.1×) at the **same moment** — so the caching discount
-appears identically on both sides and cancels in the difference. What remains as
-"savings" is only the token reduction from turning dense text into images, never
-the prompt-caching discount itself.
+**both** the real request and a `count_tokens` counterfactual of the original
+body with the **same** cache rates (create 1.25×, read 0.1×) and the **same
+warmth** — the text counterfactual only reads its prefix cheaply on a turn where
+a warm cache genuinely existed (<300s since the session's last turn), and pays
+the create otherwise, exactly as the imaged path does. Because both arms face the
+same discount under the same warmth, it cancels in the difference and what
+remains as "savings" is only the token reduction from turning dense text into
+images, never the prompt-caching discount itself.

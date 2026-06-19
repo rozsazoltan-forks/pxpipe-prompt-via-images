@@ -12,6 +12,8 @@ export interface TrackEvent {
   ts: string;
   method: string;
   path: string;
+  /** Top-level request model when present. */
+  model?: string;
   status: number;
   duration_ms: number;
   first_byte_ms?: number;
@@ -27,6 +29,10 @@ export interface TrackEvent {
   image_bytes?: number;
   /** Total pixel area across all rendered images; pairs with cache_create_tokens for px/token regression. */
   image_pixels?: number;
+  /** GPT only: vision tokens billed for rendered images. */
+  image_tokens?: number;
+  /** GPT only: o200k text tokens the imaged/stripped content would have cost. */
+  baseline_imaged_tokens?: number;
   /** TEXT chars in the outgoing body (all text blocks, incl. non-compressed tool_results).
    *  With image_pixels, a regression over cold-miss events solves chars_per_token (α) and pixels_per_token (β). */
   outgoing_text_chars?: number;
@@ -84,11 +90,13 @@ export interface TrackEvent {
   claude_md_sha8?: string;
   first_user_sha8?: string;
 
-  // From Anthropic Usage:
+  // From Anthropic/OpenAI Usage:
   input_tokens?: number;
   output_tokens?: number;
   cache_create_tokens?: number;
   cache_read_tokens?: number;
+  /** OpenAI prompt-cache hits (subset of input_tokens), from input/prompt_tokens_details.cached_tokens. */
+  cached_tokens?: number;
   /** Cache_create split by tier — 1.25x (5-min) and 2x (1-hour) input rates.
    *  Their sum equals `cache_create_tokens` when both fields are present. */
   cache_create_5m_tokens?: number;
@@ -146,6 +154,7 @@ export function toTrackEvent(ev: ProxyEvent): TrackEvent {
     status: ev.status,
     duration_ms: ev.durationMs,
   };
+  if (ev.model) out.model = ev.model;
   if (ev.firstByteMs !== undefined) out.first_byte_ms = ev.firstByteMs;
   if (ev.error) out.error = ev.error;
   if (ev.errorBody) out.error_body = ev.errorBody;
@@ -171,6 +180,12 @@ export function toTrackEvent(ev: ProxyEvent): TrackEvent {
     if (info.imageBytes !== undefined) out.image_bytes = info.imageBytes;
     if (info.imagePixels !== undefined && info.imagePixels > 0) {
       out.image_pixels = info.imagePixels;
+    }
+    if (info.imageTokens !== undefined && info.imageTokens > 0) {
+      out.image_tokens = info.imageTokens;
+    }
+    if (info.baselineImagedTokens !== undefined && info.baselineImagedTokens > 0) {
+      out.baseline_imaged_tokens = info.baselineImagedTokens;
     }
     if (info.outgoingTextChars !== undefined && info.outgoingTextChars > 0) {
       out.outgoing_text_chars = info.outgoingTextChars;
@@ -253,6 +268,8 @@ export function toTrackEvent(ev: ProxyEvent): TrackEvent {
       out.cache_create_tokens = u.cache_creation_input_tokens;
     if (u.cache_read_input_tokens !== undefined)
       out.cache_read_tokens = u.cache_read_input_tokens;
+    if (u.cached_tokens !== undefined)
+      out.cached_tokens = u.cached_tokens;
     // cache_creation splits cache_creation_input_tokens across 5-min (1.25x) and 1-hour (2x) tiers.
     if (u.cache_creation) {
       if (u.cache_creation.ephemeral_5m_input_tokens !== undefined)

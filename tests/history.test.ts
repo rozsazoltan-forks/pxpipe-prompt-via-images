@@ -338,6 +338,37 @@ describe('collapseHistory', () => {
     expect(content.filter((c) => c.type === 'image')).toHaveLength(info.collapsedImages);
   });
 
+  it('reflow packs newline-heavy history into fewer rendered pixels; collapsedChars stays original', async () => {
+    // Newline-heavy transcript: many SHORT lines. Without reflow each short
+    // line burns a full render row and no ↵ marker appears; with reflow the
+    // lines pack and hard breaks become ↵ glyphs → same legibility, fewer rows.
+    const body = Array.from({ length: 400 }, (_, i) => `l${i}`).join('\n');
+    const msgs: Message[] = [usr(body), asst(body), usr(body)];
+
+    const off = await collapseHistory(msgs, () => true, {
+      keepTail: 0,
+      minCollapsePrefix: 1,
+      collapseChunk: 0,
+      reflow: false,
+    });
+    const on = await collapseHistory(msgs, () => true, {
+      keepTail: 0,
+      minCollapsePrefix: 1,
+      collapseChunk: 0,
+      reflow: true,
+    });
+
+    expect(off.info.reason).toBe(undefined);
+    expect(on.info.reason).toBe(undefined);
+    // Reflow only changes RENDERING: denser pack → fewer pixels (and ≤ images).
+    expect(on.info.collapsedImagePixels).toBeLessThan(off.info.collapsedImagePixels);
+    expect(on.info.collapsedImages).toBeLessThanOrEqual(off.info.collapsedImages);
+    // The o200k/cache byte-stability ride on the original transcript length —
+    // collapsedChars must NOT change with reflow.
+    expect(on.info.collapsedChars).toBe(off.info.collapsedChars);
+    expect(on.info.collapsedChars).toBeGreaterThan(body.length); // real transcript, not reflowed
+  });
+
   it('preserves a tool_use sequence that straddles the live-tail boundary', async () => {
     // 14 turns: 10 closed turns, then an open tool_use at index 10 that closes at index 12.
     // Per-turn body bumped to 4200 chars so the row-aware gate (numCols=1) clears

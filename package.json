@@ -92,7 +92,9 @@
       "esbuild@>=0.27.3 <0.28.1": "^0.28.1"
     }
   },
-  "dependencies": {},
+  "dependencies": {
+    "gpt-tokenizer": "^3.4.0"
+  },
   "repository": {
     "type": "git",
     "url": "git+https://github.com/teamchong/pxpipe.git"

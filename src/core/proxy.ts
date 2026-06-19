@@ -38,6 +38,8 @@ export interface ProxyConfig {
 export interface ProxyEvent {
   method: string;
   path: string;
+  /** Top-level request model when present. Used for telemetry/dashboard labels only. */
+  model?: string;
   status: number;
   /** Wall-clock ms from request start to event fire (≈ end of upstream body). */
   durationMs: number;
@@ -131,6 +133,13 @@ function processSseEvent(
   // OpenAI chunks have no `event:` line; usage only present when stream_options.include_usage is set.
   const openAIUsage = normalizeUsage((obj as { usage?: unknown }).usage);
   if (openAIUsage) state.usage = openAIUsage;
+  // OpenAI Responses API streams usage nested under `response` on the terminal
+  // `response.completed` (or `.incomplete`) event — not at the top level.
+  if (event === 'response.completed' || event === 'response.incomplete') {
+    const resp = obj.response as { usage?: unknown } | undefined;
+    const respUsage = normalizeUsage(resp?.usage);
+    if (respUsage) state.usage = respUsage;
+  }
   measureOpenAIChoices(obj, m);
 
   if (event === 'message_start') {
@@ -194,6 +203,14 @@ function normalizeUsage(raw: unknown): Usage | undefined {
   // OpenAI field aliases.
   if (typeof u.prompt_tokens === 'number') out.input_tokens = u.prompt_tokens;
   if (typeof u.completion_tokens === 'number') out.output_tokens = u.completion_tokens;
+  // OpenAI prompt-cache hits live in a details sub-object: Responses uses
+  // `input_tokens_details.cached_tokens`, Chat uses `prompt_tokens_details`.
+  const details =
+    (u.input_tokens_details as Record<string, unknown> | undefined) ??
+    (u.prompt_tokens_details as Record<string, unknown> | undefined);
+  if (details && typeof details.cached_tokens === 'number') {
+    out.cached_tokens = details.cached_tokens;
+  }
 
   return Object.keys(out).length > 0 ? out : undefined;
 }
@@ -423,6 +440,42 @@ function filterHeaders(src: Headers, strip: Set<string>): Headers {
   return out;
 }
 
+const PASSTHROUGH_PREFIXES = [
+  '/anthropic/',
+  '/openai/',
+  '/google-ai-studio/',
+  '/compat/',
+] as const;
+
+function isProviderPrefixedPath(pathname: string): boolean {
+  return PASSTHROUGH_PREFIXES.some((prefix) => pathname.startsWith(prefix));
+}
+
+function isAnthropicMessagesPath(pathname: string): boolean {
+  return pathname === '/v1/messages'
+    || pathname === '/anthropic/v1/messages'
+    || pathname === '/anthropic/messages';
+}
+
+function isOpenAIChatPath(pathname: string): boolean {
+  return pathname === '/v1/chat/completions' || pathname === '/openai/v1/chat/completions';
+}
+
+function isOpenAIResponsesPath(pathname: string): boolean {
+  return pathname === '/v1/responses'
+    || pathname === '/openai/v1/responses'
+    || pathname === '/openai/responses';
+}
+
+function isCanonicalOpenAIPath(pathname: string, headers: Headers, hasOpenAIKey: boolean): boolean {
+  const isModelsPath = pathname === '/v1/models' || pathname.startsWith('/v1/models/');
+  const looksOpenAIAuth = hasOpenAIKey || (headers.has('authorization') && !headers.has('x-api-key'));
+  return pathname === '/v1/chat/completions'
+    || pathname === '/v1/responses'
+    || pathname.startsWith('/v1/responses/')
+    || (isModelsPath && looksOpenAIAuth);
+}
+
 /** POST /v1/messages/count_tokens with the given body. Returns the upstream's
  *  `input_tokens` number or null on any failure. count_tokens is documented
  *  as a free endpoint (no input-token billing) — we use it once per request
@@ -430,12 +483,12 @@ function filterHeaders(src: Headers, strip: Set<string>): Headers {
  *  post-compression tokens already come back free in the /v1/messages usage
  *  block (input_tokens + cache_create + cache_read), so no second probe. */
 async function countTokensUpstream(
-  upstream: string,
+  countTokensUrl: string,
   body: Uint8Array,
   headers: Headers,
 ): Promise<number | null> {
   try {
-    const res = await fetch(upstream + '/v1/messages/count_tokens', {
+    const res = await fetch(countTokensUrl, {
       method: 'POST',
       headers,
       body: body as unknown as BodyInit,
@@ -494,6 +547,9 @@ export function createProxy(config: ProxyConfig = {}) {
   const routes = resolveUpstreams(config);
   const upstream = routes.anthropic;
   const openAIUpstream = routes.openai;
+  const passthroughUpstream = config.provider === 'cloudflare-ai-gateway'
+    ? (config.gatewayBaseUrl ?? '').replace(/\/+$/, '')
+    : upstream;
   const gatewayHeaders = config.gatewayHeaders ?? {};
   const applyGatewayHeaders = (h: Headers): Headers => {
     for (const [k, v] of Object.entries(gatewayHeaders)) h.set(k, v);
@@ -565,6 +621,7 @@ export function createProxy(config: ProxyConfig = {}) {
         await config.onRequest?.({
           method: req.method,
           path: url.pathname,
+          model: requestModel,
           status,
           durationMs: Date.now() - t0,
           firstByteMs,
@@ -581,22 +638,20 @@ export function createProxy(config: ProxyConfig = {}) {
     };
 
     // Transform only known shapes; everything else passes through.
-    const isMessages = req.method === 'POST' && url.pathname === '/v1/messages';
-    const isOpenAIChat = req.method === 'POST' && url.pathname === '/v1/chat/completions';
-    const isOpenAIResponses = req.method === 'POST' && url.pathname === '/v1/responses';
-    const isModelsPath = url.pathname === '/v1/models' || url.pathname.startsWith('/v1/models/');
-    const looksOpenAIAuth =
-      config.openAIApiKey !== undefined
-      || (req.headers.has('authorization') && !req.headers.has('x-api-key'));
-    const isOpenAIPath =
-      url.pathname === '/v1/chat/completions'
-      || url.pathname === '/v1/responses'
-      || url.pathname.startsWith('/v1/responses/')
-      || (isModelsPath && looksOpenAIAuth);
-    const upstreamBase = isOpenAIPath ? openAIUpstream : upstream;
+    const providerPrefixed = isProviderPrefixedPath(url.pathname);
+    const isMessages = req.method === 'POST' && isAnthropicMessagesPath(url.pathname);
+    const isOpenAIChat = req.method === 'POST' && isOpenAIChatPath(url.pathname);
+    const isOpenAIResponses = req.method === 'POST' && isOpenAIResponsesPath(url.pathname);
+    const isOpenAIPath = isCanonicalOpenAIPath(
+      url.pathname,
+      req.headers,
+      config.openAIApiKey !== undefined,
+    );
+    const upstreamBase = providerPrefixed ? passthroughUpstream : isOpenAIPath ? openAIUpstream : upstream;
 
     let bodyOut: BodyInit | null = null;
     let info: TransformInfo | undefined;
+    let requestModel: string | undefined;
 
     // Two count_tokens probes on the pre-compression body (see docs/HISTORY_CACHE_MODEL.md):
     //   baselinePromise          → full-body input_tokens
@@ -613,6 +668,7 @@ export function createProxy(config: ProxyConfig = {}) {
           typeof config.transform === 'function' ? config.transform() : config.transform;
         // Fail-closed: unreadable model → no compression, not a risky guess.
         const model = readModelField(bodyIn);
+        requestModel = model ?? undefined;
         const modelOk = isMessages
           ? isPxpipeSupportedModel(model)
           : isPxpipeSupportedGptModel(model);
@@ -639,12 +695,17 @@ export function createProxy(config: ProxyConfig = {}) {
             const ctHeaders = applyGatewayHeaders(filterHeaders(req.headers, STRIP_REQ_HEADERS));
             ctHeaders.set('content-type', 'application/json');
             if (config.apiKey) ctHeaders.set('x-api-key', config.apiKey);
-            baselinePromise = countTokensUpstream(upstream, ctBody, ctHeaders);
+            // Mirror the actual outbound request base+path: count_tokens lives at
+            // `<messages-path>/count_tokens`, so provider-prefixed routes like
+            // `/anthropic/messages` probe `/anthropic/messages/count_tokens`.
+            const ctBase = providerPrefixed ? passthroughUpstream : upstream;
+            const ctUrl = ctBase + url.pathname + '/count_tokens';
+            baselinePromise = countTokensUpstream(ctUrl, ctBody, ctHeaders);
             // Null = no markers → cacheable=0 by definition, no probe needed.
             const ctCacheableBody = buildCacheablePrefixCountTokensBody(bodyIn);
             if (ctCacheableBody) {
               baselineCacheablePromise = countTokensUpstream(
-                upstream,
+                ctUrl,
                 ctCacheableBody,
                 new Headers(ctHeaders),
               );
@@ -665,13 +726,15 @@ export function createProxy(config: ProxyConfig = {}) {
     const outHeaders = filterHeaders(req.headers, STRIP_REQ_HEADERS);
     if (isOpenAIPath) {
       if (config.openAIApiKey) outHeaders.set('authorization', `Bearer ${config.openAIApiKey}`);
-    } else if (config.apiKey) {
+    } else if (config.apiKey && (!providerPrefixed || url.pathname.startsWith('/anthropic/'))) {
       outHeaders.set('x-api-key', config.apiKey);
     }
 
     applyGatewayHeaders(outHeaders);
 
-    // Gateway OpenAI routes drop the `/v1` prefix; Anthropic routes keep it.
+    // Gateway OpenAI routes drop the `/v1` prefix; provider-prefixed passthrough
+    // routes keep their full path so ocproxy-style upstreams see `/openai/*`,
+    // `/google-ai-studio/*`, etc. exactly as the client sent them.
     const outPath = isOpenAIPath && routes.stripOpenAIV1 ? path.replace(/^\/v1(?=\/)/, '') : path;
     const upstreamUrl = upstreamBase + outPath;
     let upstreamRes: Response;

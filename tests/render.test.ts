@@ -921,6 +921,32 @@ describe('transform', () => {
       });
     });
 
+    it('keeps a parameter literally named "description" (task-tool regression)', async () => {
+      // The real `task`/`question` tools have a required parameter NAMED `description`.
+      // The property must survive (only its annotation prose is stripped); deleting the
+      // property would leave `required` dangling and break the tool call.
+      const got = await rewriteOne({
+        type: 'object',
+        properties: {
+          description: { type: 'string', description: 'A short (3-5 words) description of the task' },
+          prompt: { type: 'string', description: 'The task for the agent to perform' },
+          title: { type: 'string', description: 'Property name collides with the title keyword' },
+        },
+        required: ['description', 'prompt'],
+        additionalProperties: false,
+      });
+      expect(got).toEqual({
+        type: 'object',
+        properties: {
+          description: { type: 'string' },
+          prompt: { type: 'string' },
+          title: { type: 'string' },
+        },
+        required: ['description', 'prompt'],
+        additionalProperties: false,
+      });
+    });
+
     it('Bash (command + optional timeout + boolean run_in_background) round-trips', async () => {
       const got = await rewriteOne({
         type: 'object',

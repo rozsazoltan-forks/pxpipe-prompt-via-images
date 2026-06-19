@@ -72,6 +72,10 @@ export interface Usage {
   server_tool_use?: {
     web_search_requests?: number;
   };
+  /** OpenAI prompt-cache hits — the subset of `input_tokens` served from cache
+   *  (billed at ~0.1× for the gpt-5 family). Mapped from `input_tokens_details`
+   *  / `prompt_tokens_details.cached_tokens`. Anthropic uses cache_read instead. */
+  cached_tokens?: number;
 }
 
 export interface MessagesRequest {

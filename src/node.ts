@@ -23,10 +23,9 @@ import {
   type DashboardRoute,
 } from './dashboard.js';
 
-/** Runtime config. Single codepath: every behavior is on, all tuning
- *  parameters come from DEFAULTS in transform.ts. The only adjustables
- *  are deployment concerns (where to listen, what to proxy, where to log)
- *  and they're env-var only — no CLI flags. */
+/** Runtime config. The core transform tuning comes from DEFAULTS in
+ *  transform.ts; startup knobs cover deployment plus emergency GPT scope
+ *  control. No CLI flags beyond --help/--version. */
 interface RuntimeConfig {
   port: number;
   upstream: string;
@@ -36,6 +35,38 @@ interface RuntimeConfig {
   gatewayBaseUrl?: string;
   gatewayHeaders?: Record<string, string>;
   eventsFile: string;
+}
+
+const DEFAULT_CONFIG_FILE = path.join(os.homedir(), '.config', 'pxpipe', 'config.json');
+
+function normalizeModelsConfig(value: unknown): string | undefined {
+  if (Array.isArray(value)) {
+    const models = value.map((v) => String(v).trim()).filter(Boolean);
+    return models.length > 0 ? models.join(',') : 'off';
+  }
+  if (typeof value === 'string') return value.trim() || 'off';
+  return undefined;
+}
+
+function applyConfigFileDefaults(): void {
+  const file = process.env.PXPIPE_CONFIG ?? DEFAULT_CONFIG_FILE;
+  if (!fs.existsSync(file)) return;
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(fs.readFileSync(file, 'utf8')) as unknown;
+  } catch (e) {
+    console.warn(`[pxpipe] ignored invalid config ${file}: ${(e as Error).message}`);
+    return;
+  }
+  if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return;
+  const cfg = parsed as Record<string, unknown>;
+
+  // Env wins over file config. The dashboard can still override the scope at
+  // runtime (in-memory) for an emergency live flip.
+  if (process.env.PXPIPE_MODELS === undefined) {
+    const models = normalizeModelsConfig(cfg.models);
+    if (models !== undefined) process.env.PXPIPE_MODELS = models;
+  }
 }
 
 function parseCli(argv: string[]): RuntimeConfig {
@@ -57,10 +88,12 @@ function parseCli(argv: string[]): RuntimeConfig {
       process.exit(2);
     }
   }
+  applyConfigFileDefaults();
+  const sharedUpstream = process.env.PXPIPE_UPSTREAM;
   return {
     port: Number(process.env.PORT ?? 47821),
-    upstream: process.env.ANTHROPIC_UPSTREAM ?? 'https://api.anthropic.com',
-    openAIUpstream: process.env.OPENAI_UPSTREAM ?? 'https://api.openai.com',
+    upstream: process.env.ANTHROPIC_UPSTREAM ?? sharedUpstream ?? 'https://api.anthropic.com',
+    openAIUpstream: process.env.OPENAI_UPSTREAM ?? sharedUpstream ?? 'https://api.openai.com',
     openAIApiKey: process.env.OPENAI_API_KEY,
     provider: parseProvider(process.env.PXPIPE_PROVIDER),
     gatewayBaseUrl: process.env.PXPIPE_GATEWAY_BASE_URL,
@@ -84,9 +117,9 @@ function printHelp(): void {
 Usage:
   pxpipe                run the proxy (no flags)
 
-The proxy always compresses tools, schemas, reminders, tool_results,
-and history; always tracks events to disk; and always measures real
-saved_pct via /v1/messages/count_tokens. Single codepath, no knobs.
+The proxy compresses eligible tools, schemas, reminders, tool_results,
+and history; tracks events to disk; and measures real saved_pct via
+/v1/messages/count_tokens. Dashboard controls can disable compression live.
 
 Stats, sessions, and cleanup tools live in the dashboard at
   http://127.0.0.1:<port>/  (default port 47821)
@@ -95,15 +128,22 @@ Flags:
   -h, --help              show this help
       --version           show version
 
-Environment (deployment-only):
+Environment:
   PORT                    listen port (default 47821)
-  ANTHROPIC_UPSTREAM      upstream API base (default https://api.anthropic.com)
-  OPENAI_UPSTREAM         OpenAI API base (default https://api.openai.com)
+  PXPIPE_UPSTREAM         upstream API base for every API family
+  ANTHROPIC_UPSTREAM      Anthropic API base; overrides PXPIPE_UPSTREAM
+                           (default https://api.anthropic.com)
+  OPENAI_UPSTREAM         OpenAI API base; overrides PXPIPE_UPSTREAM
+                           (default https://api.openai.com)
   OPENAI_API_KEY          optional OpenAI key override; otherwise forwarded
   PXPIPE_PROVIDER         optional: 'cloudflare-ai-gateway' — route both API
                           families through one gateway base URL
   PXPIPE_GATEWAY_BASE_URL gateway base URL (required with PXPIPE_PROVIDER)
   PXPIPE_GATEWAY_HEADERS  extra upstream headers: JSON object or k=v;k2=v2
+  PXPIPE_MODELS           comma-separated model bases to image (Claude + GPT);
+                          default claude-fable-5,gpt-5.6; off disables
+  PXPIPE_CONFIG           JSON config path (default ~/.config/pxpipe/config.json)
+                          supports {"models": [...]} or {"models": "off"}
   PXPIPE_LOG              JSONL events path (default ~/.pxpipe/events.jsonl)
 
 Use with Claude Code:

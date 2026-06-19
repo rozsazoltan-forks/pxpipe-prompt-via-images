@@ -51,7 +51,8 @@ ANTHROPIC_BASE_URL=http://localhost:47821 claude  # point Claude Code at it
 ```
 
 Open <http://127.0.0.1:47821/> for a live dashboard: tokens saved, per-session
-stats, every text→image conversion side by side, and a kill switch.
+stats, every text→image conversion side by side, a global kill switch, and
+runtime model chips including GPT 5.6 and GPT 5.5.
 
 Nothing else changes. Responses stream normally; pxpipe only compresses the
 *request* (your context going up), never the model's output. Recent turns stay
@@ -87,11 +88,19 @@ variance, not compression. Small n, details and caveats below.
 (~3.5 chars/token). The built-in gate only images content where the math wins,
 calibrated against N=391 production rows.
 
-**Model scope: Fable 5 by default** (`claude-fable-5`), enforced in library and
-proxy. Opus 4.7/4.8 was the original scope but misread ~7% of renders
-(`10200`→`9400`), so it was turned **off by default** once Fable 5 hit 100/100
-with identical image billing — opt it back in at your own risk via
-`PXPIPE_MODELS` or the dashboard chips. Everything else passes through untouched.
+**Model scope:** one `PXPIPE_MODELS` CSV controls which model bases get imaged
+across both families — default `claude-fable-5,gpt-5.6` (GPT 5.5 is opt-in;
+it degrades on imaged context). Set
+`PXPIPE_MODELS=off` to disable imaging entirely, or use
+`~/.config/pxpipe/config.json` with `{ "models": "off" }` (or a list). For GPT,
+pxpipe keeps tool definitions in native JSON (only verbose schema prose moves
+into the image) so tool-calling stays reliable; unlike the Claude path, the GPT
+path does not add or depend on Anthropic `cache_control` prompt-cache markers.
+The dashboard chips can flip any model live without changing client configs.
+Opus 4.7/4.8 was the original Claude scope but misread ~7% of renders
+(`10200`→`9400`), so it was turned off by default once Fable 5 hit 100/100 with
+identical image billing — opt it back in at your own risk via `PXPIPE_MODELS` or
+the dashboard chips. Everything else passes through untouched.
 
 ## Benchmarks (reproducible)
 

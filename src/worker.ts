@@ -16,6 +16,8 @@ import type { TransformOptions } from './core/transform.js';
 import { toTrackEvent, JsonLogTracker, noopTracker, type Tracker } from './core/tracker.js';
 
 export interface Env {
+  /** Optional single upstream base for every API family. Family-specific env vars override it. */
+  PXPIPE_UPSTREAM?: string;
   ANTHROPIC_UPSTREAM?: string;
   /** Optional override — if set, replaces whatever x-api-key the client sent. */
   ANTHROPIC_API_KEY?: string;
@@ -70,10 +72,11 @@ export default {
     // the Node host writes to disk.
     const tracker: Tracker = trackingOn ? new JsonLogTracker((s) => console.log(s)) : noopTracker;
 
+    const sharedUpstream = env.PXPIPE_UPSTREAM;
     const config: ProxyConfig = {
-      upstream: env.ANTHROPIC_UPSTREAM ?? 'https://api.anthropic.com',
+      upstream: env.ANTHROPIC_UPSTREAM ?? sharedUpstream ?? 'https://api.anthropic.com',
       apiKey: env.ANTHROPIC_API_KEY,
-      openAIUpstream: env.OPENAI_UPSTREAM ?? 'https://api.openai.com',
+      openAIUpstream: env.OPENAI_UPSTREAM ?? sharedUpstream ?? 'https://api.openai.com',
       openAIApiKey: env.OPENAI_API_KEY,
       transform,
       onRequest: (e) => {

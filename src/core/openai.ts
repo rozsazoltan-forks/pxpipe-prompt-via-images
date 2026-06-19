@@ -2,6 +2,8 @@
  * OpenAI Chat Completions + Responses API transformer for the GPT-5 family.
  * Separate from the Anthropic path: no cache-control breakpoints,
  * images as image_url/input_image parts, system/developer messages in messages[]/input[].
+ * OpenAI tools keep native names/descriptions/schema shape; verbose schema prose
+ * is also rendered into images for token savings so calls do not depend only on OCR.
  */
 
 import {
@@ -21,6 +23,15 @@ import {
   type TransformInfo,
   type TransformOptions,
 } from './transform.js';
+import { stripSchemaDescriptions } from './schema-strip.js';
+import {
+  planGptCollapse,
+  responsesItemsToTurns,
+  chatMessagesToTurns,
+  type GptCollapsePlan,
+  type GptHistoryOptions,
+} from './openai-history.js';
+import { countTokens as o200kCountTokens } from 'gpt-tokenizer/encoding/o200k_base';
 
 // 768px-wide portrait strip. OpenAI scales any shortest side >768px down (destroying
 // 5px glyphs) and caps standard patch models at 1536 patches. 152*5 + 8px pad = 768px,
@@ -43,7 +54,11 @@ export function resolveVisionCost(model: string): VisionCost {
   if (/^(?:gpt-5(?:\.\d+)?|gpt-4\.1)-(?:mini|nano)/.test(m) || /^o4-mini/.test(m)) {
     return { regime: 'patch', multiplier: /nano/.test(m) ? 2.46 : 1.62, patchCap: 1536 };
   }
-  if (/^gpt-5\.\d/.test(m)) return { regime: 'patch', multiplier: 1.62, patchCap: 2500 }; // 5.x flagship
+  // 5.x flagship (gpt-5.4/5.5/5.6, no -mini/-nano): patch model with NO multiplier
+  // (=1.0; the 1.62/2.46 values are mini/nano only) and the `detail:original`
+  // budget of 10,000 patches / 6000px. pxpipe sends detail:original, so the cap is
+  // 10,000 — NOT `high`'s 2,500, which would downscale dense text into illegibility.
+  if (/^gpt-5\.\d/.test(m)) return { regime: 'patch', multiplier: 1, patchCap: 10000 };
   if (/^gpt-5/.test(m)) return { regime: 'tile', base: 70, perTile: 140 };                // gpt-5 / chat-latest
   if (/^o[13]/.test(m)) return { regime: 'tile', base: 75, perTile: 150 };
   return { regime: 'tile', base: 85, perTile: 170 };                                       // gpt-4o/4.1/4.5 + default
@@ -73,7 +88,7 @@ interface OpenAIImagePart {
   type: 'image_url';
   image_url: {
     url: string;
-    detail?: 'auto' | 'low' | 'high';
+    detail?: 'auto' | 'low' | 'high' | 'original';
   };
 }
 
@@ -113,7 +128,7 @@ interface ResponsesInputTextPart {
 interface ResponsesInputImagePart {
   type: 'input_image';
   image_url: string;
-  detail?: 'auto' | 'low' | 'high';
+  detail?: 'auto' | 'low' | 'high' | 'original';
   [k: string]: unknown;
 }
 
@@ -125,19 +140,19 @@ interface ResponsesInputItem {
   [k: string]: unknown;
 }
 
-interface ResponsesFlatTool {
-  type: 'function';
-  name?: string;
-  description?: string;
-  parameters?: unknown;
-  [k: string]: unknown;
-}
-
 interface ResponsesRequest {
   model: string;
   instructions?: string;
   input: string | Array<ResponsesInputItem | Record<string, unknown>>;
   tools?: unknown[];
+  [k: string]: unknown;
+}
+
+interface ResponsesFlatTool {
+  type: 'function';
+  name?: string;
+  description?: string;
+  parameters?: unknown;
   [k: string]: unknown;
 }
 
@@ -150,6 +165,8 @@ interface OpenAIResolvedOptions {
   multiCol: number;
   charsPerToken: number;
   reflow: boolean;
+  collapseHistory: boolean;
+  gptHistory?: Partial<GptHistoryOptions>;
 }
 
 const DEFAULTS: OpenAIResolvedOptions = {
@@ -161,16 +178,8 @@ const DEFAULTS: OpenAIResolvedOptions = {
   multiCol: 1,
   charsPerToken: 4, // conservative OpenAI default; override after telemetry
   reflow: true,
+  collapseHistory: true,
 };
-
-const SCHEMA_STRIP_KEYS = new Set([
-  'description',
-  'title',
-  'examples',
-  'default',
-  '$schema',
-  '$id',
-]);
 
 function resolveOptions(opts: TransformOptions): OpenAIResolvedOptions {
   return {
@@ -182,6 +191,8 @@ function resolveOptions(opts: TransformOptions): OpenAIResolvedOptions {
     multiCol: opts.multiCol ?? DEFAULTS.multiCol,
     charsPerToken: opts.charsPerToken ?? DEFAULTS.charsPerToken,
     reflow: opts.reflow ?? DEFAULTS.reflow,
+    collapseHistory: opts.collapseHistory ?? DEFAULTS.collapseHistory,
+    gptHistory: opts.gptHistory,
   };
 }
 
@@ -245,6 +256,32 @@ function firstUserText(req: OpenAIChatRequest): string {
   return '';
 }
 
+function responsesContentText(content: ResponsesInputItem['content']): string {
+  if (typeof content === 'string') return content;
+  if (!Array.isArray(content)) return '';
+  return content
+    .filter((p): p is ResponsesInputTextPart =>
+      typeof p === 'object'
+      && p !== null
+      && (p as { type?: unknown }).type === 'input_text'
+      && typeof (p as { text?: unknown }).text === 'string')
+    .map((p) => p.text)
+    .join('\n\n');
+}
+
+function firstResponsesUserText(
+  inputWasString: boolean,
+  originalInput: string | undefined,
+  inputItems: Array<ResponsesInputItem | Record<string, unknown>>,
+): string {
+  if (inputWasString) return (originalInput ?? '').slice(0, 4096);
+  for (const item of inputItems) {
+    if ((item as ResponsesInputItem).role !== 'user') continue;
+    return responsesContentText((item as ResponsesInputItem).content).slice(0, 4096);
+  }
+  return '';
+}
+
 function isFunctionTool(tool: unknown): tool is OpenAIFunctionTool {
   return (
     typeof tool === 'object'
@@ -283,19 +320,7 @@ function renderFlatToolDoc(tool: ResponsesFlatTool, includeSchema: boolean): str
   return parts.join('\n');
 }
 
-function stripSchemaDescriptions(value: unknown, depth = 0): unknown {
-  if (depth > 20) return value;
-  if (Array.isArray(value)) return value.map((v) => stripSchemaDescriptions(v, depth + 1));
-  if (!value || typeof value !== 'object') return value;
-  const out: Record<string, unknown> = {};
-  for (const [k, v] of Object.entries(value as Record<string, unknown>)) {
-    if (SCHEMA_STRIP_KEYS.has(k)) continue;
-    out[k] = stripSchemaDescriptions(v, depth + 1);
-  }
-  return out;
-}
-
-function rewriteTools(tools: unknown[] | undefined, compressSchemas: boolean): {
+function rewriteToolsForGpt(tools: unknown[] | undefined, compressSchemas: boolean): {
   tools: unknown[] | undefined;
   docs: string;
 } {
@@ -305,22 +330,20 @@ function rewriteTools(tools: unknown[] | undefined, compressSchemas: boolean): {
   const rewritten = tools.map((tool) => {
     if (!isFunctionTool(tool)) return tool;
     docs.push(renderToolDoc(tool, compressSchemas));
-    const fn = { ...tool.function };
-    if (typeof fn.description === 'string' && fn.description.length > 0) {
-      fn.description = 'See rendered tool docs image.';
-      changed = true;
-    }
-    if (compressSchemas && fn.parameters !== undefined) {
-      fn.parameters = stripSchemaDescriptions(fn.parameters);
-      changed = true;
-    }
-    return { ...tool, function: fn };
+    if (!compressSchemas || tool.function.parameters === undefined) return tool;
+    changed = true;
+    return {
+      ...tool,
+      function: {
+        ...tool.function,
+        parameters: stripSchemaDescriptions(tool.function.parameters),
+      },
+    };
   });
   return { tools: changed ? rewritten : tools, docs: docs.join('\n\n') };
 }
 
-/** Rewrite flat Responses API tools (name/description/parameters at top level). */
-function rewriteFlatTools(tools: unknown[] | undefined, compressSchemas: boolean): {
+function rewriteFlatToolsForGpt(tools: unknown[] | undefined, compressSchemas: boolean): {
   tools: unknown[] | undefined;
   docs: string;
 } {
@@ -330,16 +353,12 @@ function rewriteFlatTools(tools: unknown[] | undefined, compressSchemas: boolean
   const rewritten = tools.map((tool) => {
     if (!isFlatFunctionTool(tool)) return tool;
     docs.push(renderFlatToolDoc(tool, compressSchemas));
-    const t = { ...tool };
-    if (typeof t.description === 'string' && t.description.length > 0) {
-      t.description = 'See rendered tool docs image.';
-      changed = true;
-    }
-    if (compressSchemas && t.parameters !== undefined) {
-      t.parameters = stripSchemaDescriptions(t.parameters);
-      changed = true;
-    }
-    return t;
+    if (!compressSchemas || tool.parameters === undefined) return tool;
+    changed = true;
+    return {
+      ...tool,
+      parameters: stripSchemaDescriptions(tool.parameters),
+    };
   });
   return { tools: changed ? rewritten : tools, docs: docs.join('\n\n') };
 }
@@ -349,7 +368,7 @@ function openAIImagePart(img: RenderedImage): OpenAIImagePart {
     type: 'image_url',
     image_url: {
       url: `data:image/png;base64,${bytesToBase64(img.png)}`,
-      detail: 'high', // dense text needs high-detail vision to remain legible
+      detail: 'original', // gpt-5.x: 'original' = 10k-patch/6000px budget; 'high' (2.5k/2048px) downscales dense text
     },
   };
 }
@@ -359,7 +378,7 @@ function responsesImagePart(img: RenderedImage): ResponsesInputImagePart {
   return {
     type: 'input_image',
     image_url: `data:image/png;base64,${bytesToBase64(img.png)}`,
-    detail: 'high',
+    detail: 'original', // see openAIImagePart: avoid 'high' downscale of dense text
   };
 }
 
@@ -429,21 +448,99 @@ function accumulateRenderedImages(
   return { droppedCodepoints };
 }
 
+/** o200k_base token count — gpt-5 / gpt-4o / o-series share this encoding. The
+ *  honest "as plain text" baseline for the content pxpipe imaged. Pure JS, no
+ *  native build, runs in both Node and Workers. */
+function gptTextTokens(text: string): number {
+  if (!text) return 0;
+  try {
+    return o200kCountTokens(text);
+  } catch {
+    return 0;
+  }
+}
+
+/** Vision-token cost of the rendered images, summed over their real dims —
+ *  what GPT actually bills as input for the slab pxpipe imaged. */
+function gptImageTokens(model: string, images: RenderedImage[]): number {
+  let n = 0;
+  for (const img of images) n += openAIVisionTokens(model, img.width, img.height);
+  return n;
+}
+
+/** Text-token value of what pxpipe replaced with images this request: the
+ *  original system/developer text (now a pointer + image) plus the tool
+ *  *description* tokens stripped from the native JSON (the verbose docs moved
+ *  into the image). Tool *structure* stays in the JSON on both paths, so only
+ *  the stripped delta counts. Compared against gptImageTokens for the saving. */
+function gptBaselineImagedTokens(
+  systemTexts: string[],
+  originalTools: unknown[] | undefined,
+  strippedTools: unknown[] | undefined,
+): number {
+  let n = 0;
+  for (const t of systemTexts) n += gptTextTokens(t);
+  const orig = Array.isArray(originalTools) && originalTools.length > 0
+    ? gptTextTokens(JSON.stringify(originalTools))
+    : 0;
+  const stripped = Array.isArray(strippedTools) && strippedTools.length > 0
+    ? gptTextTokens(JSON.stringify(strippedTools))
+    : 0;
+  return n + Math.max(0, orig - stripped);
+}
+
+/** Fold a history-collapse plan into TransformInfo: the history images cost
+ *  vision tokens (added to imageTokens) and stand in for the o200k text tokens
+ *  the collapsed transcript would have cost unproxied (added to baselineImagedTokens).
+ *  openai-savings.ts then credits (baseline − image) × cache-weight with no
+ *  further change. Also merges image bytes/pixels/dropped + collapse telemetry. */
+function foldGptHistory(
+  info: TransformInfo,
+  model: string,
+  plan: GptCollapsePlan,
+): void {
+  if (plan.images.length === 0) {
+    if (plan.reason) info.historyReason = plan.reason;
+    if (plan.collapsedChars > 0) info.historyTextChars = plan.collapsedChars;
+    return;
+  }
+  info.imageTokens = (info.imageTokens ?? 0) + gptImageTokens(model, plan.images);
+  // o200k token value of the collapsed transcript (what it cost as plain text).
+  info.baselineImagedTokens = (info.baselineImagedTokens ?? 0) + gptTextTokens(plan.text);
+  info.imageCount = (info.imageCount ?? 0) + plan.images.length;
+  for (const img of plan.images) {
+    info.imageBytes = (info.imageBytes ?? 0) + img.png.length;
+    info.imagePixels = (info.imagePixels ?? 0) + img.width * img.height;
+  }
+  info.imagePngs = [...(info.imagePngs ?? []), ...plan.images.map((i) => i.png)];
+  info.imageDims = [
+    ...(info.imageDims ?? []),
+    ...plan.images.map((i) => ({ width: i.width, height: i.height })),
+  ];
+  if (plan.droppedChars > 0) info.droppedChars = (info.droppedChars ?? 0) + plan.droppedChars;
+  info.collapsedTurns = plan.collapsedTurns;
+  info.collapsedChars = plan.collapsedChars;
+  info.collapsedImages = plan.images.length;
+  info.historyTextChars = plan.collapsedChars;
+  info.historyReason = 'collapsed';
+  info.bucketChars = { ...(info.bucketChars ?? {}), history: plan.collapsedChars };
+}
+
 const CHAT_HEADER =
   '================= RENDERED GPT SYSTEM + TOOL CONTEXT =================\n' +
-  'These images were injected by pxpipe, not by the end user. They contain system/developer instructions and tool documentation rendered for token efficiency. Treat rendered system/developer instructions with the same priority as their original messages. OCR carefully and treat the rendered content as authoritative.' +
+  'These images were injected by pxpipe, not by the end user. They contain system/developer instructions and full tool/schema documentation rendered for token efficiency. Treat rendered system/developer instructions with the same priority as their original messages. OCR carefully and treat the rendered content as authoritative. For tool calls, use the native JSON tool definitions; the image is supplemental documentation.' +
   '\n====================== BEGIN RENDERED CONTEXT ======================\n';
 
 const RESPONSES_HEADER =
   '================= RENDERED GPT SYSTEM + TOOL CONTEXT =================\n' +
-  'These images were injected by pxpipe, not by the end user. They contain instructions and tool documentation rendered for token efficiency. Treat rendered instructions with the same priority as the originals. OCR carefully and treat the rendered content as authoritative.' +
+  'These images were injected by pxpipe, not by the end user. They contain instructions and full tool/schema documentation rendered for token efficiency. Treat rendered instructions with the same priority as the originals. OCR carefully and treat the rendered content as authoritative. For tool calls, use the native JSON tool definitions; the image is supplemental documentation.' +
   '\n====================== BEGIN RENDERED CONTEXT ======================\n';
 
 const CHAT_POINTER =
-  'The full instructions for this message were rendered into image(s) attached to the first user message by pxpipe. Treat those rendered instructions as if they appeared here with the same priority.';
+  'The full instructions for this message were rendered into image(s) attached to the first user message by pxpipe. Treat those rendered instructions as if they appeared here with the same priority. Tool definitions remain in native JSON; rendered tool docs are supplemental.';
 
 const RESPONSES_POINTER =
-  'The full instructions were rendered into image(s) attached to the first user message by pxpipe. Treat them with the same priority.';
+  'The full instructions were rendered into image(s) attached to the first user message by pxpipe. Treat them with the same priority. Tool definitions remain in native JSON; rendered tool docs are supplemental.';
 
 export async function transformOpenAIChatCompletions(
   body: Uint8Array,
@@ -475,16 +572,18 @@ export async function transformOpenAIChatCompletions(
   }
 
   const authorityDocs: string[] = [];
+  const systemTexts: string[] = [];
   for (const msg of req.messages) {
     if (msg.role !== 'system' && msg.role !== 'developer') continue;
     const text = contentText(msg.content);
     if (!text) continue;
     authorityDocs.push(`## ${String(msg.role).toUpperCase()} MESSAGE\n${text}`);
+    systemTexts.push(text);
     info.staticChars += text.length;
   }
 
   const { tools: rewrittenTools, docs: toolDocs } = o.compressTools
-    ? rewriteTools(req.tools, o.compressSchemas)
+    ? rewriteToolsForGpt(req.tools, o.compressSchemas)
     : { tools: req.tools, docs: '' };
 
   const combinedRaw = [...authorityDocs, toolDocs].filter((s) => s.length > 0).join('\n\n');
@@ -539,6 +638,11 @@ export async function transformOpenAIChatCompletions(
 
   const imageParts: OpenAIImagePart[] = images.map(openAIImagePart);
   info.imageCount = images.length;
+  // GPT savings basis: vision tokens the images actually cost vs the text tokens
+  // the same content would have cost unproxied. req.tools is still the original
+  // (reassigned to the stripped set below). See src/core/openai-savings.ts.
+  info.imageTokens = gptImageTokens(req.model, images);
+  info.baselineImagedTokens = gptBaselineImagedTokens(systemTexts, req.tools, rewrittenTools);
   info.compressedChars = combinedRaw.length;
   info.bucketChars = { static_slab: combinedRaw.length };
   info.systemSha8 = await sha8(combined);
@@ -560,8 +664,37 @@ export async function transformOpenAIChatCompletions(
     if (!contentText(msg.content)) continue;
     setTextContent(msg, CHAT_POINTER);
   }
-  if (rewrittenTools !== undefined) req.tools = rewrittenTools;
 
+  // Collapse the OLD conversation prefix into history image(s). The first user
+  // message (firstUserIdx) carries the static slab and is protected; the bulk is
+  // the transcript OpenCode resends every turn.
+  if (o.collapseHistory) {
+    const turns = chatMessagesToTurns(req.messages);
+    const profitable = (text: string, cols: number) =>
+      evalOpenAIGate(req.model, text, cols, o.charsPerToken).profitable;
+    const plan = await planGptCollapse(turns, firstUserIdx + 1, profitable, { ...o.gptHistory, reflow: o.reflow });
+    foldGptHistory(info, req.model, plan);
+    if (plan.images.length > 0) {
+      const synthetic: OpenAIChatMessage = {
+        role: 'user',
+        content: [
+          { type: 'text', text: '[Earlier in this conversation:]' },
+          ...plan.images.map(openAIImagePart),
+          { type: 'text', text: '[End of earlier context.]' },
+        ],
+      };
+      req.messages = [
+        ...req.messages.slice(0, plan.start),
+        synthetic,
+        ...req.messages.slice(plan.endExclusive),
+      ];
+      info.historyImageSha = await sha8(
+        plan.images.map((i) => bytesToBase64(i.png)).join(''),
+      );
+    }
+  }
+
+  if (rewrittenTools !== undefined) req.tools = rewrittenTools;
   info.outgoingTextChars = countOutgoingTextChars(req);
   info.compressed = true;
   return { body: new TextEncoder().encode(JSON.stringify(req)), info };
@@ -612,8 +745,10 @@ export async function transformOpenAIResponses(
 
   // Collect static context: instructions + system/developer items + flat tools.
   const authorityDocs: string[] = [];
+  const systemTexts: string[] = [];
   if (typeof req.instructions === 'string' && req.instructions.length > 0) {
     authorityDocs.push(`## INSTRUCTIONS\n${req.instructions}`);
+    systemTexts.push(req.instructions);
     info.staticChars += req.instructions.length;
   }
   for (const item of inputItems) {
@@ -623,11 +758,12 @@ export async function transformOpenAIResponses(
     const text = typeof content === 'string' ? content : '';
     if (!text) continue;
     authorityDocs.push(`## ${String(r).toUpperCase()} MESSAGE\n${text}`);
+    systemTexts.push(text);
     info.staticChars += text.length;
   }
 
   const { tools: rewrittenTools, docs: toolDocs } = o.compressTools
-    ? rewriteFlatTools(req.tools, o.compressSchemas)
+    ? rewriteFlatToolsForGpt(req.tools, o.compressSchemas)
     : { tools: req.tools, docs: '' };
 
   const combinedRaw = [...authorityDocs, toolDocs].filter((s) => s.length > 0).join('\n\n');
@@ -636,6 +772,9 @@ export async function transformOpenAIResponses(
     info.reason = 'no_static_context';
     return { body, info };
   }
+
+  const firstUser = firstResponsesUserText(inputWasString, originalInputString, inputItems);
+  if (firstUser) info.firstUserSha8 = await sha8(firstUser);
 
   const combined = maybeReflow(compactSlabWhitespace(combinedRaw), o.reflow);
   if (combined.length < o.minCompressChars) {
@@ -676,6 +815,10 @@ export async function transformOpenAIResponses(
   if (topDropped) info.droppedCodepointsTop = topDropped;
 
   info.imageCount = images.length;
+  // GPT savings basis (see src/core/openai-savings.ts). req.tools is still the
+  // original here — reassigned to the stripped set below.
+  info.imageTokens = gptImageTokens(req.model, images);
+  info.baselineImagedTokens = gptBaselineImagedTokens(systemTexts, req.tools, rewrittenTools);
   info.compressedChars = combinedRaw.length;
   info.bucketChars = { static_slab: combinedRaw.length };
   info.systemSha8 = await sha8(combined);
@@ -722,6 +865,35 @@ export async function transformOpenAIResponses(
       if (typeof content === 'string' && content.length > 0) {
         (item as ResponsesInputItem).content = RESPONSES_POINTER;
       }
+    }
+  }
+
+  // Collapse the OLD conversation prefix into history image(s). The static slab
+  // is small; the transcript OpenCode resends every turn is the real cost. Skip
+  // for bare-string input (single message, nothing to collapse).
+  if (o.collapseHistory && !inputWasString) {
+    const turns = responsesItemsToTurns(inputItems);
+    const profitable = (text: string, cols: number) =>
+      evalOpenAIGate(req.model, text, cols, o.charsPerToken).profitable;
+    const plan = await planGptCollapse(turns, firstUserIdx + 1, profitable, { ...o.gptHistory, reflow: o.reflow });
+    foldGptHistory(info, req.model, plan);
+    if (plan.images.length > 0) {
+      const synthetic: ResponsesInputItem = {
+        role: 'user',
+        content: [
+          { type: 'input_text', text: '[Earlier in this conversation:]' },
+          ...plan.images.map(responsesImagePart),
+          { type: 'input_text', text: '[End of earlier context.]' },
+        ],
+      };
+      req.input = [
+        ...inputItems.slice(0, plan.start),
+        synthetic,
+        ...inputItems.slice(plan.endExclusive),
+      ];
+      info.historyImageSha = await sha8(
+        plan.images.map((i) => bytesToBase64(i.png)).join(''),
+      );
     }
   }
 

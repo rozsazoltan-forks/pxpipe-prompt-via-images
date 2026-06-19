@@ -131,9 +131,10 @@ describe('aggregateSessions', () => {
 
   it('credits the real prefix compression (image prefix fewer tokens than text prefix)', async () => {
     writeEvents(tmp, [
-      // Text counterfactual: cacheable prefix 18000 read warm @0.1 + cold tail 2000
-      //   = 1800 + 2000 = 3800. actual = 1000 + 800*1.25 + 100*0.1 = 2010.
-      //   pp's cr (100) is far fewer than the text prefix (18000) -> saved 1790.
+      // First turn of the session => COLD: text would re-create the whole
+      //   cacheable prefix at 1.25x, not read it. 18000*1.25 + 2000 cold tail
+      //   = 22500 + 2000 = 24500. actual = 1000 + 800*1.25 + 100*0.1 = 2010.
+      //   saved = 24500 - 2010 = 22490.
       ev({
         first_user_sha8: 'aaaaaaaa',
         compressed: true,
@@ -143,8 +144,9 @@ describe('aggregateSessions', () => {
         cache_create_tokens: 800,
         cache_read_tokens: 100,
       }),
-      // Whole body cacheable: baseline = 9000*0.1 = 900. actual = 5 + 8000*0.1 = 805.
-      //   pp's image prefix (cr 8000) < text prefix (9000) -> saved 95.
+      // WARM turn (same session, same ts < TTL): prior cacheable 18000 >= 9000,
+      //   so the whole prefix is reused @0.1 = 900. actual = 5 + 8000*0.1 = 805.
+      //   saved = 95.
       ev({
         first_user_sha8: 'aaaaaaaa',
         compressed: true,
@@ -172,9 +174,9 @@ describe('aggregateSessions', () => {
     ]);
     const { sessions } = await aggregateSessions(tmp);
     const s = sessions.get('aaaaaaaa')!;
-    // 1790 + 95 + 0 = 1885
-    expect(s.tokensSavedEst).toBe(1_885);
-    expect(s.charsSaved).toBe(1_885 * 4);
+    // 22490 (cold) + 95 (warm) + 0 (probe miss) = 22585
+    expect(s.tokensSavedEst).toBe(22_585);
+    expect(s.charsSaved).toBe(22_585 * 4);
     expect(s.requestCount).toBe(4);
   });
 
@@ -189,9 +191,11 @@ describe('aggregateSessions', () => {
         input_tokens: 5,
         cache_read_tokens: 90_000,
       }),
-      // Genuine loss turn: tiny body (2000) but pp wrote 5000 cache_create.
-      //   baseline = 1900*0.1 + 100 = 290 ; actual = 3000 + 5000*1.25 = 9250.
-      //   saved = 290 - 9250 = -8960. Honest formula reports the real loss, no clamp.
+      // Genuine loss turn: tiny body (2000) but pp wrote 5000 cache_create. The
+      //   prior turn was a probe miss (no cacheable recorded), so warmth carries
+      //   prevCacheable=0 -> no reuse credited: text re-creates 1900 prefix at
+      //   1.25x. baseline = 1900*1.25 + 100 = 2475 ; actual = 3000 + 5000*1.25
+      //   = 9250. saved = 2475 - 9250 = -6775. Honest formula, no clamp.
       ev({
         first_user_sha8: 'bbbbbbbb',
         compressed: true,
@@ -203,9 +207,51 @@ describe('aggregateSessions', () => {
     ]);
     const { sessions } = await aggregateSessions(tmp);
     const s = sessions.get('bbbbbbbb')!;
-    // 0 + (-8960)
-    expect(s.tokensSavedEst).toBe(-8_960);
-    expect(s.charsSaved).toBe(-8_960 * 4);
+    // 0 + (-6775)
+    expect(s.tokensSavedEst).toBe(-6_775);
+    expect(s.charsSaved).toBe(-6_775 * 4);
+  });
+
+  it('prices a cold MISS within the TTL window as cold, not warm (cr-grounded)', async () => {
+    // Two turns 60s apart — well inside the 300s TTL. The wall clock ALONE would
+    // call turn 2 "warm" and hand it a phantom 0.1x prefix read. But turn 2's
+    // cache_read_tokens === 0: the prefix was NOT actually served warm (a cold
+    // miss / re-create within the window). If the image was cold, the text was
+    // cold too — they share one cache slot. cr-grounded warmth prices it COLD.
+    writeEvents(tmp, [
+      // Turn 1 (cold first turn) — establishes a 28k cacheable prefix, imaged to 3k.
+      //   cold baseline = 28000*1.25 + 2000 tail = 37000 ; actual = 2000 + 3000*1.25 = 5750
+      //   saved = 31250. (Also seeds warmth: prevCacheable=28000.)
+      ev({
+        first_user_sha8: 'cccccccc',
+        ts: '2026-05-19T00:00:00.000Z',
+        compressed: true,
+        baseline_tokens: 30_000,
+        baseline_cacheable_tokens: 28_000,
+        input_tokens: 2_000,
+        cache_create_tokens: 3_000,
+        cache_read_tokens: 0,
+      }),
+      // Turn 2, +60s (inside TTL) but cache_read_tokens=0 — a cold MISS.
+      //   COLD (correct): baseline = 28000*1.25 + 2000 = 37000 ; actual = 5750 ; saved = 31250.
+      //   WARM (old wall-clock bug): reused 28000@0.1 = 2800 + 2000 tail = 4800 ;
+      //     saved = 4800 - 5750 = -950 — a fabricated loss on a real cold win.
+      ev({
+        first_user_sha8: 'cccccccc',
+        ts: '2026-05-19T00:01:00.000Z',
+        compressed: true,
+        baseline_tokens: 30_000,
+        baseline_cacheable_tokens: 28_000,
+        input_tokens: 2_000,
+        cache_create_tokens: 3_000,
+        cache_read_tokens: 0,
+      }),
+    ]);
+    const { sessions } = await aggregateSessions(tmp);
+    const s = sessions.get('cccccccc')!;
+    // 31250 + 31250 — both turns are honest cold wins. The old wall-clock code
+    // booked the second as -950 (total would have been 30300).
+    expect(s.tokensSavedEst).toBe(62_500);
   });
 });
 

@@ -135,6 +135,11 @@ export async function aggregateSessions(
 ): Promise<AggregateResult> {
   const sessions = new Map<string, SessionSummary>();
   const sidecarsBySession = new Map<string, Set<string>>();
+  // Per-session warmth for the cache-aware text counterfactual, reconstructed
+  // from event ts as we scan in time order (mirrors DashboardState). Kept out
+  // of SessionSummary so it never leaks into the /api/sessions.json shape.
+  const warmth = new Map<string, { ts: number; cacheable: number }>();
+  const CACHE_TTL_SEC = 300;
 
   // Stat sidecar sizes once up front. Looking up size per event would be
   // O(N²) syscalls; the directory is small enough to read fully.
@@ -165,12 +170,18 @@ export async function aggregateSessions(
     // Cling to whichever cwd we saw first; sessions that hop directories are
     // rare and the first cwd is the most stable identifier.
     if (s.project === undefined && ev.cwd) s.project = ev.cwd;
-    // Real per-session savings, cache-aware and warmth-free. See
-    // src/core/baseline.ts for the full derivation: the cached prefix cancels
-    // (paid identically on both paths), so we credit only the net-new uncached
-    // text pxpipe compressed away — honest `baselineEff − actualEff`, NO >=0
-    // floor, so a net-losing turn (cc-heavy rewrite) lowers the total. This is
-    // deterministic — no per-session warmth state — so live and replay agree.
+    // Real per-session savings, cache-aware. See src/core/baseline.ts for the
+    // full derivation: the cached prefix cancels (paid identically on both
+    // paths), so we credit only the net-new uncached text pxpipe compressed
+    // away — honest `baselineEff − actualEff`, NO >=0 floor, so a net-losing
+    // turn (cc-heavy rewrite) lowers the total. Warmth decides whether the text
+    // counterfactual reads (0.10×) or re-creates (1.25×) the prefix, and it is
+    // grounded in the OBSERVED read: `cr > 0` means a warm cache actually served
+    // this turn (image and text share cache fate — pxpipe relocates the
+    // cache_control marker onto the image). A miss within the TTL window
+    // (`cr === 0`) was cold for both paths, so pricing text warm there would
+    // fabricate a phantom loss vs the imaged path. The wall-clock TTL is still
+    // required (a stale prefix can't be read), just no longer sufficient.
     // Events missing either probe stay out of the rollup — no estimation.
     const inp = ev.input_tokens ?? 0;
     const cc = ev.cache_create_tokens ?? 0;
@@ -183,11 +194,36 @@ export async function aggregateSessions(
       haveUsage
     ) {
       const cacheable = ev.baseline_cacheable_tokens ?? 0;
-      const baselineEff = computeBaselineInputEff(baseline, cacheable, inp, cc, cr);
+      const tsSec = Date.parse(ev.ts) / 1000;
+      const prev = warmth.get(id);
+      // cr-grounded warmth: only price text warm if a warm cache was actually
+      // observed (cr > 0). A miss within the TTL window was cold for both paths.
+      const warm = cr > 0 && prev !== undefined && tsSec - prev.ts < CACHE_TTL_SEC;
+      const baselineEff = computeBaselineInputEff(
+        baseline,
+        cacheable,
+        inp,
+        cc,
+        cr,
+        warm,
+        warm ? prev!.cacheable : 0,
+      );
       const actualEff = computeActualInputEff(inp, cc, cr);
       const tokensSaved = baselineEff - actualEff;
       s.tokensSavedEst += Math.round(tokensSaved);
       s.charsSaved += Math.round(tokensSaved * 4);
+    }
+    // Warm the cache for the next turn in this session (every usage-bearing
+    // row warms it, regardless of compression). Carry prior cacheable when this
+    // row had no probe so a probe gap doesn't reset warmth.
+    if (haveUsage) {
+      const tsSec = Date.parse(ev.ts) / 1000;
+      const cacheable = ev.baseline_cacheable_tokens ?? 0;
+      const prev = warmth.get(id);
+      warmth.set(id, {
+        ts: tsSec,
+        cacheable: cacheable > 0 ? cacheable : (prev?.cacheable ?? 0),
+      });
     }
     if (typeof ev.cache_read_tokens === 'number') {
       s.cacheReadTokens += ev.cache_read_tokens;

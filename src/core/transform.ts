@@ -35,7 +35,9 @@ import {
 } from './render.js';
 import { bytesToBase64 } from './png.js';
 import { collapseHistory } from './history.js';
+import type { GptHistoryOptions } from './openai-history.js';
 import { CACHE_CREATE_RATE, CACHE_READ_RATE } from './baseline.js';
+import { stripSchemaDescriptions } from './schema-strip.js';
 
 /** Per-block descriptor passed to `TransformOptions.keepSharp`. */
 export interface KeepSharpBlock {
@@ -100,6 +102,12 @@ export interface TransformOptions {
    *  same burn formula to the TEXT side, preventing the gate from flipping out of
    *  image mode when the image prefix is already warm. Default 0. ≤0 clamped to 0. */
   priorWarmImageTokens?: number;
+  /** GPT only: collapse the OLD closed-tool-call conversation prefix into history
+   *  image(s), keeping the recent tail as text. Independent of the static slab.
+   *  Default on. See src/core/openai-history.ts. */
+  collapseHistory?: boolean;
+  /** GPT only: history-collapse tuning overrides (keepTail / collapseChunk / …). */
+  gptHistory?: Partial<GptHistoryOptions>;
   /** Re-pack image-bound text into a ↵-delimited stream to fill `cols` (~29%→75-80%
    *  glyph-fill). ON by default (98.95% char accuracy at L1 OCR eval, +1pp vs baseline).
    *  Hard newlines become visible ↵ glyphs — tell the model via system prompt. */
@@ -139,6 +147,9 @@ const DEFAULTS: Required<TransformOptions> = {
   reflow: true,
   keepSharp: () => false,
   emitRecoverable: false,
+  // GPT-only knobs; the Anthropic transform ignores them but Required<> needs them.
+  collapseHistory: true,
+  gptHistory: {},
 };
 
 // --- per-block break-even check ---
@@ -472,6 +483,13 @@ export interface TransformInfo {
   /** Σ width×height across all rendered images. Pairs with upstream token count for
    *  empirical px/token regression: `tokens ≈ α·outgoingTextChars + β·imagePixels`. */
   imagePixels?: number;
+  /** GPT only. Vision tokens the rendered images actually cost as input
+   *  (Σ openAIVisionTokens over real image dims). The "Sent as image" basis. */
+  imageTokens?: number;
+  /** GPT only. o200k_base text tokens of the content pxpipe imaged/stripped —
+   *  the would-have-paid "as plain text" baseline. Compared against imageTokens
+   *  for the per-request saving. See src/core/openai-savings.ts. */
+  baselineImagedTokens?: number;
   /** Total TEXT chars in the outgoing body (system + messages, excluding image base64).
    *  Denominator for empirical chars-per-token regression on cold-miss events. */
   outgoingTextChars?: number;
@@ -543,6 +561,8 @@ export interface TransformInfo {
     | 'no_history'
     | 'prefix_too_short'
     | 'no_closed_prefix'
+    | 'below_min_chars'
+    | 'below_min_tokens'
     | 'not_profitable'
     | 'render_empty'
     | 'collapsed';
@@ -831,134 +851,6 @@ function stripBillingLine(text: string): { kept: string | null; body: string } {
     return { kept: first, body: nl === -1 ? '' : text.slice(nl + 1) };
   }
   return { kept: null, body: text };
-}
-
-/** Max recursion depth for schema stripping. 20 handles realistic DSL/query schemas;
- *  deeper nodes are left untouched rather than corrupted. */
-const SCHEMA_STRIP_MAX_DEPTH = 20;
-
-/** Metadata keys that add tokens but no validation; the image carries them for the model. */
-const SCHEMA_STRIP_KEYS = new Set([
-  'description',
-  'title',
-  'examples',
-  'default',
-  '$schema',
-  '$id',
-  '$comment',
-]);
-
-/** JSON Schema composition keys (values are arrays of subschemas). */
-const SCHEMA_COMPOSITION_KEYS = new Set(['oneOf', 'anyOf', 'allOf']);
-
-/** JSON Schema keys whose values are named-subschema objects. */
-const SCHEMA_NAMED_SUBSCHEMA_KEYS = new Set([
-  'properties',
-  'patternProperties',
-  'definitions',
-  '$defs',
-]);
-
-/** JSON Schema keys whose value is a single subschema. */
-const SCHEMA_SINGLE_SUBSCHEMA_KEYS = new Set([
-  'items',
-  'additionalProperties',
-  'not',
-  'contains',
-  'propertyNames',
-  'unevaluatedItems',
-  'unevaluatedProperties',
-  'if',
-  'then',
-  'else',
-]);
-
-/** JSON Schema keys that are primitives or opaque arrays — pass through verbatim. */
-const SCHEMA_VERBATIM_KEYS = new Set([
-  'required',
-  'enum',
-  'const',
-  'type',          // string or array of strings
-  '$ref',          // we don't resolve refs but we mustn't drop them
-  'minimum',
-  'maximum',
-  'exclusiveMinimum',
-  'exclusiveMaximum',
-  'minLength',
-  'maxLength',
-  'minItems',
-  'maxItems',
-  'minProperties',
-  'maxProperties',
-  'multipleOf',
-  'uniqueItems',
-  'pattern',
-]);
-
-/** Real `format` tokens (date-time, uri, email…) are short; anything longer is a description. */
-const FORMAT_MAX_LEN = 32;
-
-/** Strip long-form metadata from a JSON Schema node, preserving structural keys
- *  Anthropic's tool-use validator needs. Strips: description, title, examples, default,
- *  $schema, $id, $comment, long format. Recurses into properties/oneOf/anyOf/allOf/items
- *  etc. Returns a fresh object — never mutates the input. */
-function stripSchemaDescriptions(node: unknown, depth: number): unknown {
-  if (depth > SCHEMA_STRIP_MAX_DEPTH) return node; // leave pathological depth untouched
-  if (Array.isArray(node)) return node; // subschema arrays handled by parent
-  if (!node || typeof node !== 'object') return node;
-
-  const obj = node as Record<string, unknown>;
-  const out: Record<string, unknown> = {};
-
-  for (const [k, v] of Object.entries(obj)) {
-    if (SCHEMA_STRIP_KEYS.has(k)) continue;
-
-    if (k === 'format' && typeof v === 'string' && v.length > FORMAT_MAX_LEN) {
-      continue; // long format = description in disguise
-    }
-
-    if (SCHEMA_VERBATIM_KEYS.has(k)) {
-      out[k] = v;
-      continue;
-    }
-
-    if (
-      SCHEMA_NAMED_SUBSCHEMA_KEYS.has(k) &&
-      v &&
-      typeof v === 'object' &&
-      !Array.isArray(v)
-    ) {
-      const nested: Record<string, unknown> = {};
-      for (const [pk, pv] of Object.entries(v as Record<string, unknown>)) {
-        nested[pk] = stripSchemaDescriptions(pv, depth + 1);
-      }
-      out[k] = nested;
-      continue;
-    }
-
-    if (SCHEMA_COMPOSITION_KEYS.has(k) && Array.isArray(v)) {
-      out[k] = v.map((sub) => stripSchemaDescriptions(sub, depth + 1));
-      continue;
-    }
-
-    if (SCHEMA_SINGLE_SUBSCHEMA_KEYS.has(k)) {
-      // additionalProperties may be a boolean — pass through untouched.
-      if (typeof v === 'boolean') {
-        out[k] = v;
-      } else {
-        out[k] = stripSchemaDescriptions(v, depth + 1);
-      }
-      continue;
-    }
-
-    // Unknown key — recurse into nested objects so vendor-extension descriptions get stripped.
-    if (v && typeof v === 'object') {
-      out[k] = stripSchemaDescriptions(v, depth + 1);
-    } else {
-      out[k] = v;
-    }
-  }
-  return out;
 }
 
 /** Keys that give Anthropic's validator something to bind against. A stripped schema
@@ -1337,7 +1229,7 @@ async function runHistoryCollapseAndFinalize(
     const { messages: newMessages, info: histInfo } = await collapseHistory(
       req.messages,
       historyProfitable,
-      { cols: o.cols, protectedPrefix: 0 },
+      { cols: o.cols, protectedPrefix: 0, reflow: o.reflow },
     );
     if (histInfo.collapsedTurns > 0) {
       req.messages = newMessages;
@@ -1892,7 +1784,7 @@ export async function transformRequest(
     const { messages: newMessages, info: histInfo } = await collapseHistory(
       req.messages,
       historyProfitable,
-      { cols: o.cols, protectedPrefix: slabAnchorIdx >= 0 ? slabAnchorIdx + 1 : 0 },
+      { cols: o.cols, protectedPrefix: slabAnchorIdx >= 0 ? slabAnchorIdx + 1 : 0, reflow: o.reflow },
     );
     if (histInfo.collapsedTurns > 0) {
       req.messages = newMessages;

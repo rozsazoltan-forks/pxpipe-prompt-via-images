@@ -11,8 +11,8 @@
  * role:'assistant'. cache_control placement is left to the caller (transform.ts).
  */
 
-import type { ContentBlock, ImageBlock, Message, TextBlock, ToolUseBlock, ToolResultBlock } from './types.js';
-import { DENSE_CONTENT_CHARS_PER_IMAGE, DENSE_CONTENT_COLS, DENSE_RENDER_STYLE, renderTextToPngsWithCharLimit } from './render.js';
+import type { CacheControl, ContentBlock, ImageBlock, Message, TextBlock, ToolUseBlock, ToolResultBlock } from './types.js';
+import { DENSE_CONTENT_CHARS_PER_IMAGE, DENSE_CONTENT_COLS, DENSE_RENDER_STYLE, reflow, renderTextToPngsWithCharLimit } from './render.js';
 import { bytesToBase64 } from './png.js';
 
 /** Break-even gate predicate. Injected by transform.ts to avoid a circular import.
@@ -34,10 +34,27 @@ export interface HistoryCollapseOptions {
    *  byte-identical for collapseChunk turns and keeps hitting Anthropic's prompt cache.
    *  Set to 0 for a per-turn moving boundary. Default 50. */
   collapseChunk: number;
+  /** Append-only freeze granularity, in messages. The collapse range is rendered
+   *  as independent image blocks on an ABSOLUTE grid anchored at protectedPrefix,
+   *  in steps of this many messages. Each completed chunk's bytes are fixed by its
+   *  message range alone, so old chunks stay byte-identical (cache_read forever) as
+   *  the conversation grows — only the newest partial chunk re-renders. Caller
+   *  cache_control marks force an extra split so a roaming breakpoint stays an
+   *  aligned, independently-cacheable image boundary. Set to 0 to render the whole
+   *  range as one paginated blob (legacy, non-append-only). Default 10. */
+  freezeChunk: number;
   /** Leading messages to never collapse. Protects the slab-bearing first user message
    *  (system-prompt + tool-docs images) so its cache_control anchor stays at the front
    *  and isn't swept into the history image as [image] placeholders. Default 0. */
   protectedPrefix: number;
+  /** Reflow the transcript before RENDERING: pack soft-wrapped lines and mark
+   *  every hard newline with the ↵ sentinel — same treatment as the static slab.
+   *  History text is newline-heavy (role headers, JSON args), so without this
+   *  each short line wastes a full render row, inflating image count and shrinking
+   *  the savings. Glyph size is unchanged (cols stays the same) so legibility is
+   *  identical — it just removes the blank-row waste. `collapsedChars` still
+   *  reports the ORIGINAL transcript length. Default true. */
+  reflow: boolean;
 }
 
 export const HISTORY_DEFAULTS: HistoryCollapseOptions = {
@@ -45,7 +62,9 @@ export const HISTORY_DEFAULTS: HistoryCollapseOptions = {
   minCollapsePrefix: 10,
   cols: 100,
   collapseChunk: 50,
+  freezeChunk: 10,
   protectedPrefix: 0,
+  reflow: true,
 };
 
 /** Per-request telemetry surfaced back to TransformInfo. */
@@ -175,6 +194,18 @@ export function blocksToText(content: string | ContentBlock[]): string {
   return parts.join('\n\n');
 }
 
+/** Return the caller's cache_control marker on a message, if any block carries one.
+ *  Used to align freeze-chunk boundaries to roaming breakpoints so a marked segment
+ *  stays independently cacheable instead of being silently flattened into the image. */
+export function messageCacheControl(m: Message): CacheControl | undefined {
+  if (!Array.isArray(m.content)) return undefined;
+  for (let i = m.content.length - 1; i >= 0; i--) {
+    const b = m.content[i] as { cache_control?: CacheControl } | undefined;
+    if (b && b.cache_control !== undefined) return b.cache_control;
+  }
+  return undefined;
+}
+
 /** Serialize messages [fromInclusive..upToExclusive) to a text blob with `--- role ---` headers. */
 export function messagesToHistoryText(
   messages: Message[],
@@ -253,33 +284,76 @@ export async function collapseHistory(
     info.reason = 'render_empty';
     return { messages, info };
   }
-  if (!isProfitable(text, o.cols)) { // pass string, not length — see ProfitableFn
+  // Reflow for RENDERING ONLY: pack short lines + mark hard breaks with ↵ so the
+  // newline-heavy transcript fills full rows instead of one line per row. Same
+  // glyph size (cols unchanged) → identical legibility, fewer images, more saved.
+  // `text` stays original — it backs `collapsedChars` and the cache byte-stability.
+  const renderText = o.reflow ? reflow(text) ?? text : text;
+  if (!isProfitable(renderText, o.cols)) { // pass string, not length — see ProfitableFn
     info.reason = 'not_profitable';
     info.collapsedChars = text.length; // surface what we DIDN'T compress
     return { messages, info };
   }
-  // Use the dense readable profile (not full-canvas) to keep code/config legible.
-  const imgs = await renderTextToPngsWithCharLimit(text, DENSE_CONTENT_COLS, DENSE_CONTENT_CHARS_PER_IMAGE, DENSE_RENDER_STYLE);
-  if (imgs.length === 0) {
+  // APPEND-ONLY rendering. Render the collapse range [protectedPrefix..collapseLen)
+  // as independent image blocks on an ABSOLUTE message grid anchored at
+  // protectedPrefix (step = freezeChunk). A completed chunk's bytes are fixed by
+  // its message range alone, so old chunks stay byte-identical as the conversation
+  // grows (cache_read forever); only the newest partial chunk re-renders.
+  //
+  // Chunk-end positions = the absolute grid ∪ caller cache_control marks: a marked
+  // message forces a split right after it, and that chunk's LAST image carries the
+  // caller's marker — so a roaming breakpoint survives as an aligned, independently
+  // cacheable image boundary instead of being silently flattened (count conserved,
+  // never added). Each chunk is reflowed and rendered on its own, which is what
+  // makes the bytes a pure function of the chunk's messages.
+  const step = o.freezeChunk > 0 ? o.freezeChunk : collapseLen - protectedPrefix;
+  const ends = new Set<number>();
+  for (let e = protectedPrefix + step; e < collapseLen; e += step) ends.add(e);
+  const markerByEnd = new Map<number, CacheControl>();
+  for (let i = protectedPrefix; i < collapseLen; i++) {
+    const cc = messageCacheControl(messages[i]!);
+    if (cc !== undefined) {
+      ends.add(i + 1);
+      markerByEnd.set(i + 1, cc);
+    }
+  }
+  ends.add(collapseLen);
+  const sortedEnds = [...ends].filter((e) => e > protectedPrefix && e <= collapseLen).sort((a, b) => a - b);
+
+  const imageBlocks: Array<ImageBlock & { cache_control?: CacheControl }> = [];
+  let chunkStart = protectedPrefix;
+  for (const chunkEnd of sortedEnds) {
+    const chunkText = messagesToHistoryText(messages, chunkEnd, chunkStart);
+    chunkStart = chunkEnd;
+    if (!chunkText || chunkText.length === 0) continue;
+    const chunkRender = o.reflow ? reflow(chunkText) ?? chunkText : chunkText;
+    // Use the dense readable profile (not full-canvas) to keep code/config legible.
+    const imgs = await renderTextToPngsWithCharLimit(chunkRender, DENSE_CONTENT_COLS, DENSE_CONTENT_CHARS_PER_IMAGE, DENSE_RENDER_STYLE);
+    const markerCC = markerByEnd.get(chunkEnd);
+    for (let k = 0; k < imgs.length; k++) {
+      const img = imgs[k]!;
+      const block: ImageBlock & { cache_control?: CacheControl } = {
+        type: 'image',
+        source: {
+          type: 'base64',
+          media_type: 'image/png',
+          data: bytesToBase64(img.png),
+        },
+      };
+      // Mark the LAST image of a marked segment — the caller's breakpoint anchor.
+      if (markerCC !== undefined && k === imgs.length - 1) block.cache_control = markerCC;
+      imageBlocks.push(block);
+      info.collapsedImageBytes += img.png.length;
+      info.collapsedImagePixels += img.width * img.height;
+      info.droppedChars += img.droppedChars;
+      for (const [cp, n] of img.droppedCodepoints) {
+        info.droppedCodepoints.set(cp, (info.droppedCodepoints.get(cp) ?? 0) + n);
+      }
+    }
+  }
+  if (imageBlocks.length === 0) {
     info.reason = 'render_empty';
     return { messages, info };
-  }
-  const imageBlocks: ImageBlock[] = [];
-  for (const img of imgs) {
-    imageBlocks.push({
-      type: 'image',
-      source: {
-        type: 'base64',
-        media_type: 'image/png',
-        data: bytesToBase64(img.png),
-      },
-    });
-    info.collapsedImageBytes += img.png.length;
-    info.collapsedImagePixels += img.width * img.height;
-    info.droppedChars += img.droppedChars;
-    for (const [cp, n] of img.droppedCodepoints) {
-      info.droppedCodepoints.set(cp, (info.droppedCodepoints.get(cp) ?? 0) + n);
-    }
   }
   const syntheticContent: ContentBlock[] = [
     { type: 'text', text: '[Earlier in this conversation:]' },
