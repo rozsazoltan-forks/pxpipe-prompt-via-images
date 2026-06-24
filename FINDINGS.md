@@ -1,10 +1,52 @@
 # FINDINGS — pxpipe (text→PNG token compression)
 
 **Status:** ⚠️ **VERDICT REVERSED — see correction below.** Originally ruled "dead"; live measurement shows pxpipe is a working *lossy gist-compressor* saving ~68% on real (dense) Claude Code traffic, with a known verbatim-recall gap.
-**Date:** 2026-05-28 (original) · 2026-05-29 (correction) · 2026-06-09 (Fable 5 update) · 2026-06-10 (gist-recall A/B, SWE-bench pilot) · 2026-06-12 (field observation, n=1)
+**Date:** 2026-05-28 (original) · 2026-05-29 (correction) · 2026-06-09 (Fable 5 update) · 2026-06-10 (gist-recall A/B, SWE-bench pilot) · 2026-06-12 (field observation, n=1) · 2026-06-23 (reframe: correct baseline = /compact)
 **Models tested:** `claude-opus-4-5` (original run), `claude-opus-4-8` (re-test after a model bump), `claude-fable-5` (2026-06-09)
 **Model scope (current):** Fable 5 only, enforced in library + proxy (Opus disabled 2026-06-09 — see update below).
 **Harness:** `eval/needle-haystack/` (receipts preserved from `/tmp/needle_eval`)
+
+---
+
+## Update (2026-06-23) — reframe: the correct baseline is /compact, not verbatim recall
+
+### The wrong bar we were using
+
+Every previous entry here — including the "verdict reversed" correction — implicitly compared pxpipe against perfect verbatim recall. That was the wrong baseline. The status quo users already accept is `/compact`: a lossy, mostly irreversible LLM prose summary of everything older than the working window. Users work → hit the limit → `/compact` → continue; they can't retrieve their earlier exact prompts or tool outputs either. Holding pxpipe to a higher standard than the alternative people already use is the wrong bar.
+
+### How open-source harnesses compact (codex, opencode)
+
+The baseline is a spectrum from a single prompt to a full reducer. Claude Code's `/compact` sits at the prompt end (a plain LLM prose summary of the old turns); the two open-source harnesses below sit further along.
+
+**opencode: structured template + incremental merge + SQLite persistence, but still free-text LLM.** `packages/opencode/src/session/compaction.ts` runs a compaction agent against a hardcoded 7-section template (`SUMMARY_TEMPLATE`, `compaction.ts:43`). Tool outputs in the head are pre-truncated to 2,000 chars (`TOOL_OUTPUT_MAX_CHARS`, `compaction.ts:38`) before the summarizer sees them. A separate `prune` pass (`compaction.ts:296`; `PRUNE_MINIMUM=20_000` / `PRUNE_PROTECT=40_000`) stamps `time.compacted` and silently drops older tool-results independent of whether the summary captured them. Raw rows stay in SQLite; loss is only in what's sent to the model. `filterCompacted` (`message-v2.ts:532`) splices the summary back with array-index arithmetic the codebase itself flags as tricky (`message-v2.ts:589`).
+
+**codex: three runtime strategies plus a separate event-sourced reducer — most sophisticated by a clear margin.** Feature-flagged paths: (1) local/inline (`core/src/compact.rs::run_compact_task_inner_impl`, `:194`) using `prompts/templates/compact/prompt.md`, keeping ≤20,000 tokens of recent user messages (`COMPACT_USER_MESSAGE_MAX_TOKENS`, `compact.rs:49`), then `replace_compacted_history` (`:313`); (2) remote v1 (`compact_remote.rs`) — a proprietary remote endpoint; (3) remote v2 (`compact_remote_v2.rs`) — Responses API with a `CompactionTrigger`, retaining ≤64,000 tokens (`RETAINED_MESSAGE_TOKEN_BUDGET`, `:50`). Per-window budgets tracked via `AutoCompactWindow` (`core/src/state/auto_compact_window.rs`). The distinct layer is the rollout-trace crate: a pure event-sourced reducer (`replay_bundle`) that emits a `CompactionMarker` (`reducer/conversation.rs:324`) and writes pre/post-compaction history verbatim to disk via `CompactionCheckpointTracePayload` (`compaction.rs:84`) when `CODEX_ROLLOUT_TRACE_ROOT` is set — fully recoverable. **But that reducer is diagnostic/opt-in; codex's *live* compaction is still prose summary like the other two.**
+
+**Ranking (the two OSS harnesses):** codex is clearly more sophisticated — three runtime strategies plus the event-sourced reducer. Opencode is more capable than a plain prompt-summary (incremental merge, SQLite persistence, overflow-replay), but its prune/`filterCompacted` interaction is the messy part. Neither does verbatim — both are lossy by design, as is Claude Code's prompt-only `/compact` at the simple end.
+
+### compact vs our gist: same job, opposite loss profiles
+
+Both keep a recent text tail; they differ only on the old region (`/compact` → prose, pxpipe → images). `/compact` loses **content** but keeps **fidelity** (accurate text, model knows its limits); pxpipe loses **fidelity** but keeps **content** (it's all in the pixels, just not exactly readable).
+
+Where pxpipe ties or beats `/compact`:
+- **Recoverable, not discarded.** Bytes are in the PNGs — near-verbatim on Fable (13/15 exact, 2026-06-11 n=15 expansion; 3/4 on 06-09), and even on Opus a harness can re-OCR/re-fetch. `/compact` replaces the raw in-context.
+- **Slope, not cliff**, and no re-summarizing-a-summary compounding (codex's own code warns of that).
+- **No summarization inference**, and ~68% input saved on dense traffic.
+- **Gist parity, measured:** at the gist tier `/compact` targets, pxpipe is 98/98 (zero loss, 2026-06-10) and SWE-bench 10/10 on both arms at half cost ($27 vs $53).
+
+Where pxpipe-on-Opus is worse — the one real difference:
+- **Failure shape.** `/compact` degrades gracefully (accurate text → abstains). pxpipe-on-Opus degrades into **confident confabulation** — detail looks present in the image, so it misreads and asserts (0/15 Opus haystack; 7/10 exact in the 2026-06-12 field session, 4 char-level errors / 120 chars). This is why Opus was disabled. Fix = abstention prompting ("images are recognition-only; re-fetch for exact bytes") → then Opus degrades like `/compact`.
+
+Net: on **Fable**, pxpipe-gist beats `/compact` for gist-tolerant work; on **Opus** it's peer-or-worse until abstention prompting is added. Neither gives verbatim of the old region.
+
+### Connection to the agent-memory direction
+
+Codex's rollout-trace proves the principled path is buildable: an event-sourced reducer folding typed events into a derived state graph with verbatim payload preservation and deterministic replay. It maps onto the pxpipe agent-memory direction — the reducer decides what gets imaged (gist-bulk) vs kept as text (IDs, paths, values); image = cheap recoverable gist store, text = source of truth. Codex builds it for diagnostics only; pxpipe's compression ratio is the argument for making it the live memory.
+
+**Caveats (honest scope):**
+- pxpipe behavioral claims (Opus failure shape, field session) are n=1; gist 98/98 and SWE-bench 10/10 are controlled evals with receipts; the abstention fix is not yet measured.
+- Net session tokens on long Opus sessions still need checking — the re-read loop can claw back per-request savings (out-of-proxy-scope for GPT; Opus+abstention unmeasured).
+- Some users want the explicit `/compact` checkpoint as a workflow signal; pxpipe's gradual slope isn't a drop-in for that.
 
 ---
 
