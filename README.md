@@ -34,22 +34,24 @@ eval (see benchmarks).*
 
 ## Demo
 
+**Fable 5 demo (the default, 100/100 reader):**
+
+https://github.com/user-attachments/assets/1c8ee63a-fcd7-4958-917b-da788d718349
+
+* Both demos with both panes on **Fable 5** (plain left, pxpipe right).
+
+- **Fable reads what Opus can't.** The imaged phrase-count that Opus refuses (see the Opus demo below): the pxpipe arm counts the exact token **10/10** across 39 imaged filler files (matches `grep` ground truth line-for-line) and gets the multi-step ledger arithmetic right (8037 → … → 15,021).
+- **Same answers, ~7× cheaper.** Session totals after both demos: plain **$42.21**, context **96% full** (964.5k/1M — one task away from forced compaction) vs pxpipe **$6.06** with context to spare (73.5k/1M).
+- **Honest caveat, visible in the clip:** the pxpipe arm answered the count first and needed one follow-up nudge to also print the ledger balance in the requested one-line format; the plain arm followed the format on the first try. Legibility is solved on Fable — single-reply format compliance is the remaining rough edge.
+
+**Opus 4.8 demo (Opus disabled by default):**
+
 [![pxpipe vs plain Claude — side-by-side A/B on Opus 4.8](https://raw.githubusercontent.com/teamchong/pxpipe/main/docs/assets/pxpipe-ab-test-thumb.jpg)](https://drive.google.com/file/d/1yZYEjr9765aswomG8mopmp3GlRdSLWM1/view?usp=sharing)
 
-*Side-by-side — plain Claude (left) vs pxpipe (right), both on **Opus 4.8** (opt-in; pxpipe is tuned for Fable — see the Fable clip below). Click the image to watch (Google Drive).*
+*Side-by-side — plain Claude (left) vs pxpipe (right), both on **Opus 4.8** (opt-in; pxpipe is tuned for Fable — see the Fable clip above). Click the image to watch (Google Drive).*
 
 - **Demo 1 — fix a failing test suite:** both pass; the dashboard shows pxpipe cut the request to a fraction of the tokens (real, server-measured **context/token reduction**).
 - **Demo 2 — a big file-context (40 files, ~382k tokens) plus a math question and a "count this phrase" task:** the math answer (a small **text** needle) reads on both. The phrase-count needs reading the **imaged** filler — so pxpipe-on-Opus can't read it and **honestly surfaces that it won't fabricate a number** (the documented lossy limit: exact values stay text). Plain, meanwhile, bogs down counting file-by-file.
-
-**Fable 5 demo (the default, 100/100 reader):**
-
-[![pxpipe vs plain Claude — same two demos, both on Fable 5](https://raw.githubusercontent.com/teamchong/pxpipe/main/docs/assets/pxpipe-fable-ab-thumb.jpg)](https://drive.google.com/file/d/1pmI3quwv7uuNQ2Z7KMW-78OUOE30AzmU/view?usp=sharing)
-
-*Same two demos re-run with both panes on **Fable 5** (plain left, pxpipe right). Click to watch (Google Drive).*
-
-- **Fable reads what Opus can't.** The imaged phrase-count that Opus refused: the pxpipe arm counts the exact token **10/10** across 39 imaged filler files (matches `grep` ground truth line-for-line) and gets the multi-step ledger arithmetic right (8037 → … → 15,021).
-- **Same answers, ~9× cheaper.** Session totals after both demos: plain **$42.21**, context **96% full** (964.5k/1M — one task away from forced compaction) vs pxpipe **$4.51** with context to spare (21.7M cache-read tokens vs 451.8K).
-- **Honest caveat, visible in the clip:** the pxpipe arm answered the count first and needed one follow-up nudge to also print the ledger balance in the requested one-line format; the plain arm followed the format on the first try. Legibility is solved on Fable — single-reply format compliance is the remaining rough edge.
 
 ## Try it (30 seconds)
 
