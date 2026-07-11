@@ -33,6 +33,7 @@ import { renderTextToImages } from '../src/core/library.js';
 
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), '..');
 const OUT = join(ROOT, 'docs/assets/context-window-chars.png');
+const README_EXAMPLE = join(ROOT, 'docs/assets/example-render.png');
 
 const TEXT_CPT = 4; // chars per text token, prose rule of thumb
 const PX_PER_VISION_TOKEN = 750; // Anthropic image pricing: tokens = w*h/750
@@ -166,13 +167,22 @@ const fmtTok = (t: number): string =>
 // ---------------------------------------------------------------------------
 // 3. Draw
 // ---------------------------------------------------------------------------
+function pngWidth(path: string): number {
+  const png = readFileSync(path);
+  if (png.length < 24 || png.toString('ascii', 1, 4) !== 'PNG') {
+    throw new Error(`${path} is not a PNG`);
+  }
+  return png.readUInt32BE(16);
+}
+
 function draw(data: Point[], fableCpt: number): Buffer {
-  const S = 2; // supersample for crisp README rendering
-  const W = 1180 * S;
-  const H = 1000 * S;
-  const canvas = createCanvas(W, H);
+  const logicalWidth = 1180;
+  const logicalHeight = 1000;
+  const outputWidth = pngWidth(README_EXAMPLE);
+  const scale = outputWidth / logicalWidth;
+  const canvas = createCanvas(outputWidth, Math.round(logicalHeight * scale));
   const ctx = canvas.getContext('2d');
-  ctx.scale(S, S);
+  ctx.scale(scale, scale);
 
   const bg = '#0d1117';
   const grid = '#21262d';
