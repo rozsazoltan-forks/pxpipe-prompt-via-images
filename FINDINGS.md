@@ -3,8 +3,26 @@
 **Status:** ⚠️ **VERDICT REVERSED — see correction below.** Originally ruled "dead"; live measurement shows pxpipe is a working *lossy gist-compressor* saving ~68% on real (dense) Claude Code traffic, with a known verbatim-recall gap.
 **Date:** 2026-05-28 (original) · 2026-05-29 (correction) · 2026-06-09 (Fable 5 update) · 2026-06-10 (gist-recall A/B, SWE-bench pilot) · 2026-06-12 (field observation, n=1) · 2026-06-23 (reframe: correct baseline = /compact) · 2026-07-09 (GPT-5.6 Sol raw-recall pilot)
 **Models tested:** `claude-opus-4-5` (original run), `claude-opus-4-8` (re-test after a model bump), `claude-fable-5` (2026-06-09), `gpt-5.6-sol` (2026-07-09 raw-image pilot)
-**Model scope (current):** Fable 5 only, enforced in library + proxy. Sol, Opus, GPT 5.5, and Grok remain available only through explicit opt-in.
+**Model scope (current):** Fable 5 only. Sol, Opus, GPT 5.5, and Grok remain explicit opt-ins.
 **Harnesses:** Claude/Opus/Fable: `eval/needle-haystack/` (older receipts preserved from `/tmp/needle_eval`); Sol: `eval/sol-profile/` (raw responses and receipts committed)
+
+---
+
+## Update (2026-07-11) — Sol 5×8 evaluated, remains opt-in
+
+The exact `gpt-5.6-sol` profile now uses Spleen 5×8 at 152 columns. It remains
+an explicit opt-in. Fresh novel arithmetic scored 96/100 pure-image and 98/100
+with the production factsheet. Matched input usage was 5,300 text tokens versus
+7,000 production-image tokens, 32% more on this short workload.
+
+On the portable gist corpus, Sol scored 79/93 completed answerable probes,
+18/18 state probes, and 4/15 completed never-stated confabulations. One
+six-probe session failed at the gateway and is reported as a transport error,
+not six model misses. Dense 12-character hex recall scored 0/15.
+
+These results keep Sol below the Fable default bar. Native recent/open state and
+the verbatim factsheet remain required guards. Sibling `gpt-5.6-*` ids do not
+inherit the Sol profile or allowlist.
 
 ---
 
@@ -60,9 +78,8 @@ explicit operator opt-in:
 
     PXPIPE_MODELS=claude-fable-5,gpt-5.6-sol
 
-Re-enabling Sol by default requires a retuned paid arm to clear 4/4 exact, zero
-confabulations, gist, and guard with positive savings; a replicated pass on both
-fixtures is preferred before silent promotion.
+The larger 2026-07-11 evaluation changed Sol's profile to 5×8, but broader
+recall still kept it opt-in.
 
 Receipts and every raw response:
 [`eval/sol-profile/RESULTS.md`](eval/sol-profile/RESULTS.md).

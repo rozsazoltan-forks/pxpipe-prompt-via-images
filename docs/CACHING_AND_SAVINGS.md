@@ -258,20 +258,20 @@ Measured on local `/v1/responses` rows (same endpoint, different models):
 | gpt-5 | ~73% | often | ~34% overall; ~42% on collapsed warm rows |
 
 Render profiles are selected by exact model id, not by the shared Responses
-path. Opt-in `gpt-5.6-sol` uses 126 columns with a 6×11 JetBrains Mono atlas;
+path. Opt-in `gpt-5.6-sol` uses 152 columns with a 5×8 Spleen atlas;
 Claude uses 312 columns with the 5×8 Spleen atlas. Grok remains **opt-in** and
 uses **5×8** / 152 columns at maxHeight 512 with white AA (**no grid**) plus an
-in-image IDS block and the text factsheet (exact IDs). Pure-image alone is not
-Fable-level on live multi-seed. See
+in-image IDS block and the text factsheet. Its measured arithmetic, gist, and
+state results remain below Fable. See
 [eval/grok-density/QUALITY_RESULTS.md](../eval/grok-density/QUALITY_RESULTS.md).
 
-Those profile and savings numbers are not recall evidence. The Sol raw-image
-pilot separately tested both 6×11/126 and old 5×8/152: each scored 0/4 exact
-with four confabulations, and 5×8 also missed gist. Sol is therefore off by
-default; production's fact-sheet remains an important exact-token fallback for
-operators who explicitly opt in. The locally rendered Sol 9×12 retune remains
-untested. See
-[`eval/sol-profile/RESULTS.md`](../eval/sol-profile/RESULTS.md).
+The early n=1 raw-image pilot failed both 6×11 and the old shared 5×8
+call. The larger production-profile follow-up scored 96/100 pure and
+98/100 production arithmetic, but broader gist and dense exact recall remained
+below Fable. Sol is kept opt-in; sibling GPT-5.6 variants remain off.
+Production still sends the identifier factsheet because image text is not byte-safe. See
+[`eval/sol-profile/QUALITY_RESULTS.md`](../eval/sol-profile/QUALITY_RESULTS.md).
+
 
 So "Codex shows 1% on Opus" is not "Codex unsupported." It is "this session's
 prompt was already ~98% cached text, history collapse did not fire, and only
