@@ -19,6 +19,27 @@ behavioral changes, patch = fixes).
   from disabled models, including passthrough subagents, no longer affects the
   headline numbers; re-enabling a model restores its retained history.
 
+### Fixed
+- **Env relocation no longer re-surfaces model-identity lines as per-turn
+  guidance.** The relocated `# Environment` block ("You are powered by …",
+  "default to the latest and most capable Claude models") landed in the LAST
+  user message every turn — exactly where the parent model picks subagent
+  models — steering `Agent` calls to fable instead of haiku and *increasing*
+  net cost for affected sessions. Root fix: a
+  diff-based static/volatile split (`splitEnvByVolatility`) learns, per
+  project (`claudeMdSha`), which env entries are byte-stable and promotes
+  them into the imaged slab — identity/catalog lines are stable, so from a
+  project's second session onward they ride the slab in their original
+  system-derived position instead of the per-turn tail. The identity-line
+  regex stays as a second layer for fresh sessions and churned entries.
+  Guarantees preserved: first-ever sightings stay volatile (git state never
+  bakes into a fresh session's image), the slab never re-renders mid-session
+  (the static side is frozen byte-exact; a churned entry re-emits fresh text
+  on the tail, superseding its stale slab copy, and demotes next session),
+  and the no-user-message fallback (env stays in system) is unchanged.
+  Stable entries now also stop paying live-text rates every turn; telemetry
+  reports the split via `envStaticChars` / `envVolatileKeys`.
+
 ### Known limitations / evidence
 - A direct `gpt-5.6-sol` raw-image pilot tested **both** the new JetBrains
   6×11/126-column profile and the old Spleen 5×8/152-column profile. Each scored

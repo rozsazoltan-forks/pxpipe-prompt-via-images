@@ -554,6 +554,10 @@ export interface TransformInfo {
   /** Static-slab tags whose content changed within a session — proven dynamic,
    *  busting the image cache each turn. The real alert signal. */
   churningStaticTags?: string[];
+  /** `# Environment` entries that rode the live tail this turn (diff split). */
+  envVolatileKeys?: string[];
+  /** Chars of `# Environment` entries promoted into the imaged slab. */
+  envStaticChars?: number;
   env?: EnvFields;
   /** sha8 of static slab + tool docs (what goes in the image). Repeats across turns → cache hits. */
   systemSha8?: string;
@@ -1055,13 +1059,187 @@ function stripBillingLine(text: string): { kept: string | null; body: string } {
  *  wrapper, so splitStaticDynamic can't catch it — yet its git-status lines
  *  change across sessions, and baking them into the slab PNG busts the cross-
  *  session cache (system_sha8 717f1fce → 5efaa4bb for a one-file edit). Parallel
- *  to stripBillingLine: `kept` re-enters the system tail as plain text. */
+ *  to stripBillingLine: `kept` re-enters the system tail as plain text — after
+ *  splitEnvByVolatility routes its proven-stable entries into the slab. */
 function stripMarkdownEnvSection(text: string): { kept: string; body: string } {
   const m = /(?:^|\n)(# Environment\b[\s\S]*?)(?=\n#{1,6}\s|$)/.exec(text);
   if (!m) return { kept: '', body: text };
   return {
     kept: m[1]!.trimEnd(),
     body: text.slice(0, m.index) + text.slice(m.index + m[0].length),
+  };
+}
+
+/** Model-identity/catalog lines dropped from RELOCATED env text (field report,
+ *  2026-07: higher spend with pxpipe because subagents ran on the parent model).
+ *  In the system prompt these lines are static low-salience context; appended to
+ *  the LAST user message every turn they read as fresh instructions at the exact
+ *  point where the model picks a subagent model — "default to the latest and
+ *  most capable Claude models" right next to an Agent call means fable, not
+ *  haiku. The live model already knows its identity from its own system prompt,
+ *  so relocation loses nothing. Redaction applies ONLY on the relocation path;
+ *  the no-user-message fallback keeps env text in system, where these lines
+ *  keep their original (harmless) position.
+ *
+ *  Since the diff-based split (splitEnvByVolatility) this regex is the SECOND
+ *  layer: identity entries are byte-stable, so from a session's second project
+ *  sighting onward they ride the imaged slab in their original system-derived
+ *  position and never reach this filter. It still guards the tail for fresh
+ *  sessions/projects and for entries that churn (e.g. a /model switch). */
+const MODEL_IDENTITY_LINE =
+  /you are powered by|exact model id is|most recent claude models|default to the latest and most capable/i;
+
+function redactModelIdentityLines(text: string): string {
+  return text
+    .split('\n')
+    .filter((line) => !MODEL_IDENTITY_LINE.test(line))
+    .join('\n');
+}
+
+/* ── Diff-based static/volatile `# Environment` split ──────────────────────
+ * The env section is mostly session-static (cwd, platform, OS, model catalog)
+ * with a few churning entries (git state). Blanket relocation to the per-turn
+ * tail is cache-safe but pays live-text rates every turn for bytes that never
+ * change. The split promotes entries PROVEN stable into the imaged slab and
+ * keeps the rest on the tail. Invariants (pinned by cache-stability e2e):
+ *   1. No promotion without history — a first-ever sighting is volatile, so a
+ *      fresh session/project never bakes git state into the image (the 48.8%
+ *      cold-create fix stays intact).
+ *   2. The slab NEVER re-renders mid-session — the static side is frozen
+ *      byte-exact at the session's first transform. If a promoted entry churns
+ *      anyway, the slab keeps its stale bytes and the fresh text re-emits on
+ *      the live tail (the later copy supersedes), while history marks it
+ *      churned so the NEXT session demotes it.
+ *   3. No project key (claudeMdSha absent) → no learning, all volatile: a
+ *      shared fallback key would let one project's stable sightings promote
+ *      another project's entries. */
+
+/** One env entry: a top-level bullet (` - Key: …`) or bare `Key: …` line plus
+ *  its deeper-indented continuation lines. */
+interface EnvEntry {
+  key: string;
+  hash: number;
+  text: string;
+}
+
+const ENV_ENTRY_START = /^ ?- (.{1,200})$|^([A-Za-z][^:\n]{0,63}):(?: |$)/;
+
+function parseEnvEntries(env: string): { header: string; entries: EnvEntry[] } {
+  const headerLines: string[] = [];
+  const entries: EnvEntry[] = [];
+  let cur: string[] | null = null;
+  let curKey = '';
+  const flush = () => {
+    if (cur) {
+      const text = cur.join('\n').trimEnd();
+      entries.push({ key: curKey, hash: fnv1a(text), text });
+    }
+    cur = null;
+  };
+  for (const line of env.split('\n')) {
+    const m = line.startsWith('#') ? null : ENV_ENTRY_START.exec(line);
+    if (m) {
+      flush();
+      const head = (m[1] ?? m[2] ?? '').trim();
+      curKey = head.split(':', 1)[0]!.slice(0, 64).trim();
+      cur = [line];
+    } else if (cur) {
+      cur.push(line); // continuation (nested list item / wrapped prose)
+    } else {
+      headerLines.push(line);
+    }
+  }
+  flush();
+  return { header: headerLines.join('\n').trimEnd(), entries };
+}
+
+/** Cross-session churn history: `${projectKey}\0${entryKey}` → last content
+ *  hash + sticky churn flag. Bounded LRU (same pattern as tagObservations). */
+const ENV_HISTORY_MAX = 8192;
+const envEntryHistory = new Map<string, { hash: number; churned: boolean }>();
+
+/** Per-session frozen partition — decided once at the session's first
+ *  transform; `frozenStatic` bytes ride the slab unchanged all session. */
+interface EnvPartition {
+  frozenStatic: string;
+  staticHash: Map<string, number>;
+}
+const ENV_PARTITIONS_MAX = 512;
+const envSessionPartitions = new Map<string, EnvPartition>();
+
+/** Test hook: classification state is process-global (learning across
+ *  sessions is the point), so suites that replay sessions reset between cases. */
+export function resetEnvSplitState(): void {
+  envEntryHistory.clear();
+  envSessionPartitions.clear();
+}
+
+export function splitEnvByVolatility(
+  env: string,
+  projectKey: string | undefined,
+  sessionKey: string,
+): { staticEnv: string; volatileEnv: string; volatileKeys: string[] } {
+  if (!env) return { staticEnv: '', volatileEnv: '', volatileKeys: [] };
+  if (!projectKey) return { staticEnv: '', volatileEnv: env, volatileKeys: [] };
+
+  const { header, entries } = parseEnvEntries(env);
+
+  // Freeze the partition on the session's first sighting (invariant 2).
+  let part = envSessionPartitions.get(sessionKey);
+  if (!part) {
+    const staticHash = new Map<string, number>();
+    const staticParts: string[] = [];
+    for (const e of entries) {
+      const h = envEntryHistory.get(`${projectKey}\0${e.key}`);
+      if (h && !h.churned && h.hash === e.hash) {
+        staticHash.set(e.key, e.hash);
+        staticParts.push(e.text);
+      }
+    }
+    part = {
+      frozenStatic:
+        staticParts.length > 0
+          ? [header, ...staticParts].filter((s) => s.length > 0).join('\n')
+          : '',
+      staticHash,
+    };
+  } else {
+    envSessionPartitions.delete(sessionKey); // refresh LRU position
+  }
+  envSessionPartitions.set(sessionKey, part);
+  while (envSessionPartitions.size > ENV_PARTITIONS_MAX) {
+    const oldest = envSessionPartitions.keys().next().value;
+    if (oldest === undefined) break;
+    envSessionPartitions.delete(oldest);
+  }
+
+  // Route entries and record churn history (sticky flag, LRU refresh).
+  const volatileParts: string[] = [];
+  const volatileKeys: string[] = [];
+  for (const e of entries) {
+    const key = `${projectKey}\0${e.key}`;
+    const prev = envEntryHistory.get(key);
+    const churned =
+      (prev?.churned ?? false) || (prev !== undefined && prev.hash !== e.hash);
+    if (prev !== undefined) envEntryHistory.delete(key); // refresh LRU position
+    envEntryHistory.set(key, { hash: e.hash, churned });
+    if (part.staticHash.get(e.key) === e.hash) continue; // riding the slab, unchanged
+    volatileParts.push(e.text);
+    volatileKeys.push(e.key);
+  }
+  while (envEntryHistory.size > ENV_HISTORY_MAX) {
+    const oldest = envEntryHistory.keys().next().value;
+    if (oldest === undefined) break;
+    envEntryHistory.delete(oldest);
+  }
+
+  return {
+    staticEnv: part.frozenStatic,
+    volatileEnv:
+      volatileParts.length > 0
+        ? [header, ...volatileParts].filter((s) => s.length > 0).join('\n')
+        : '',
+    volatileKeys,
   };
 }
 
@@ -1545,7 +1723,8 @@ export async function transformRequest(
     staticTagContents,
   } = splitStaticDynamic(sysBody);
   info.staticChars = staticText.length;
-  info.dynamicChars = dynamicText.length + envMarkdown.length;
+  // dynamicChars is finalized after the env split below — only the VOLATILE
+  // side of `# Environment` counts as dynamic once stable entries ride the slab.
   info.dynamicBlockCount = dynBlocks;
   if (unknownTags.length > 0) info.unknownStaticTags = unknownTags;
   // Parse env fields out of the dynamic slab — telemetry only, never mutates.
@@ -1573,6 +1752,19 @@ export async function transformRequest(
     );
     if (churning.length > 0) info.churningStaticTags = churning;
   }
+
+  // Diff-based `# Environment` split (see splitEnvByVolatility): entries
+  // proven stable across sessions ride the imaged slab; churned/new entries
+  // keep the existing live-tail relocation. Without a user message there is
+  // nowhere to carry the slab or the tail, so the whole section stays
+  // volatile and falls back into system further down, exactly as before.
+  const hasUserMsg = (req.messages ?? []).some((m) => m.role === 'user');
+  const { staticEnv, volatileEnv, volatileKeys: envVolatileKeys } = hasUserMsg
+    ? splitEnvByVolatility(envMarkdown, claudeMdSha, firstUserSha ?? claudeMdSha ?? 'global')
+    : { staticEnv: '', volatileEnv: envMarkdown, volatileKeys: [] as string[] };
+  if (staticEnv) info.envStaticChars = staticEnv.length;
+  if (envVolatileKeys.length > 0) info.envVolatileKeys = envVolatileKeys;
+  info.dynamicChars = dynamicText.length + volatileEnv.length;
 
   // 2. Move tool docs into the imaged "Tool Reference", stubbing originals.
   //    Imaged (not text) because that IS the compression — descriptions and
@@ -1644,7 +1836,10 @@ export async function transformRequest(
       toolDocsText +
       '\n=== END TOOL REFERENCE ==='
     : '';
-  const combinedRaw = [staticText, toolReferenceText]
+  // staticEnv: `# Environment` entries proven session-stable (diff split
+  // above) ride the slab at image rates; frozen byte-exact per session so
+  // this never re-renders mid-session.
+  const combinedRaw = [staticText, staticEnv, toolReferenceText]
     .filter((s) => s.length > 0)
     .join('\n\n');
   // Compact then reflow before the gate; gate/renderer/paging all see the same text.
@@ -1783,13 +1978,20 @@ export async function transformRequest(
   // events.jsonl 2026-06-26..07-02). It is carried instead at the END of the
   // last user message — the per-turn live tail that re-caches incrementally
   // anyway — appended late in this function, AFTER history collapse, so it can
-  // never be baked into a frozen history chunk. Fallback: if no user message
-  // exists to carry it, keep it in system rather than drop content.
-  const hasUserMsg = (req.messages ?? []).some((m) => m.role === 'user');
+  // never be baked into a frozen history chunk. Only the VOLATILE side of the
+  // env split rides here — stable entries were promoted into the slab above.
+  // Fallback: if no user message exists to carry it, keep it in system rather
+  // than drop content (volatileEnv holds the full section in that case).
   const volatileEnvParts: string[] = [];
   if (dynamicText) volatileEnvParts.push(dynamicText);
-  if (envMarkdown) volatileEnvParts.push(envMarkdown);
-  const volatileEnvText = hasUserMsg ? volatileEnvParts.join('\n\n') : '';
+  if (volatileEnv) volatileEnvParts.push(volatileEnv);
+  // Redact model-identity/catalog lines ONLY when relocating into a user
+  // message (see MODEL_IDENTITY_LINE — second layer behind the env split):
+  // the !hasUserMsg fallback keeps env text in system, its original position,
+  // where those lines stay harmless.
+  const volatileEnvText = hasUserMsg
+    ? redactModelIdentityLines(volatileEnvParts.join('\n\n')).trim()
+    : '';
 
   // Images go into first user message — system field rejects images (400 system.N.type).
   {
@@ -1799,7 +2001,7 @@ export async function transformRequest(
     if (billingLine) sysTail.push({ type: 'text', text: billingLine });
     if (!hasUserMsg) {
       if (dynamicText) sysTail.push({ type: 'text', text: dynamicText });
-      if (envMarkdown) sysTail.push({ type: 'text', text: envMarkdown });
+      if (volatileEnv) sysTail.push({ type: 'text', text: volatileEnv });
     }
     if (Array.isArray(sysRemainder)) sysTail.push(...sysRemainder);
     // Tool Reference now rides INSIDE the imaged slab (combinedRaw above) — no
