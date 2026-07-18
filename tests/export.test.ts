@@ -16,6 +16,7 @@ import {
 } from '../src/core/export.js';
 import { extractFactSheetTokensAllPages, extractFactSheetTokens } from '../src/core/factsheet.js';
 import { DENSE_CONTENT_CHARS_PER_IMAGE } from '../src/core/render.js';
+import { patchTokens } from '../src/core/anthropic-vision.js';
 
 // ---------------------------------------------------------------------------
 // Temp-dir helpers
@@ -500,35 +501,33 @@ describe('runExportCore integration', () => {
 // ---------------------------------------------------------------------------
 
 describe('exportImageTokens model routing', () => {
-  // Dense export page: width = 2*4 + 384*5 = 1928 px, height = MAX_HEIGHT_PX = 1932 px
-  const W = 1928;
-  const H = 1932;
+  // Current full dense export page: width = 2*PAD_X + 312*CELL_W = 1568 px,
+  // height = MAX_HEIGHT_PX = 728 px. Fits both Anthropic tiers unchanged, so the
+  // cost is the raw 28-px patch count: ⌈1568/28⌉×⌈728/28⌉ = 56×26 = 1456.
+  const W = 1568;
+  const H = 728;
 
   it('returns Anthropic-formula tokens for claude-sonnet-4-5', () => {
-    // Anthropic formula: ceil(W*H/750 * 1.10)
-    const expected = Math.ceil((W * H / 750) * 1.10);
-    expect(exportImageTokens('claude-sonnet-4-5', W, H)).toBe(expected);
+    expect(exportImageTokens('claude-sonnet-4-5', W, H)).toBe(patchTokens(W, H));
+    expect(exportImageTokens('claude-sonnet-4-5', W, H)).toBe(1456);
   });
 
   it('returns Anthropic-formula tokens for any claude-* model', () => {
-    const expected = Math.ceil((W * H / 750) * 1.10);
-    expect(exportImageTokens('claude-opus-4', W, H)).toBe(expected);
-    expect(exportImageTokens('claude-haiku-3-5', W, H)).toBe(expected);
+    expect(exportImageTokens('claude-opus-4', W, H)).toBe(patchTokens(W, H));
+    expect(exportImageTokens('claude-haiku-3-5', W, H)).toBe(patchTokens(W, H));
   });
 
   it('returns Anthropic-formula tokens when model includes "anthropic"', () => {
-    const expected = Math.ceil((W * H / 750) * 1.10);
-    expect(exportImageTokens('anthropic/claude-3-5-sonnet', W, H)).toBe(expected);
+    expect(exportImageTokens('anthropic/claude-3-5-sonnet', W, H)).toBe(patchTokens(W, H));
   });
 
-  it('returns GPT (OpenAI tile) tokens for gpt-4o', () => {
-    // OpenAI tile formula is much cheaper for this image size (~765 vs ~5464)
+  it('routes gpt-4o to the OpenAI tile formula, not the Anthropic patch formula', () => {
     const gpTokens = exportImageTokens('gpt-4o', W, H);
     const claudeTokens = exportImageTokens('claude-sonnet-4-5', W, H);
-    // GPT-4o tile formula for 1928x1932 px: scaled to 768x769, 2x2 tiles
-    // = 85 + 170*4 = 765 tokens — far less than Anthropic's ~5464
-    expect(gpTokens).toBeLessThan(claudeTokens);
     expect(gpTokens).toBeGreaterThan(0);
+    // Different pricing model → different number (they happen to be close at this
+    // size, but must not be computed by the same formula).
+    expect(gpTokens).not.toBe(claudeTokens);
   });
 
   it('uses measured Grok pixel pricing instead of the GPT fallback', () => {
@@ -538,12 +537,12 @@ describe('exportImageTokens model routing', () => {
     );
   });
 
-  it('Claude image tokens are substantially higher than GPT for the same full-page image', () => {
-    // The issue was a ~7x underestimate when using GPT formula for Claude.
-    // Verify the ratio is at least 5x so the fix is clearly meaningful.
-    const claudeTokens = exportImageTokens('claude-sonnet-4-5', W, H);
-    const gpTokens = exportImageTokens('gpt-4o', W, H);
-    expect(claudeTokens / gpTokens).toBeGreaterThan(5);
+  it('caps a huge Claude image at the tier visual-token budget (patch downscale)', () => {
+    // The old ceil(w*h/750*1.10) formula ignored Anthropic's downscale and grossly
+    // overcharged large images (a 1928² page "cost" ~5464 when the API bills ≤1568
+    // on the standard tier / 4761 on high-res). The patch model honors the cap.
+    expect(exportImageTokens('claude-sonnet-4-5', 4000, 4000)).toBeLessThanOrEqual(1568);
+    expect(exportImageTokens('claude-fable-5', 4000, 4000)).toBeLessThanOrEqual(4784);
   });
 
   it('computeTokenReport uses Anthropic formula for default claude model', () => {

@@ -248,8 +248,9 @@ export function parseExportArgv(
  * Per-image vision-token cost for a rendered PNG at the given pixel dimensions.
  *
  * - **Claude / Anthropic models** (`model.startsWith('claude')` or
- *   `model.includes('anthropic')`): uses Anthropic's billing formula
- *   `ceil(width × height / 750 × 1.10)`, matching the live transform.
+ *   `model.includes('anthropic')`): Anthropic's documented 28-px patch model
+ *   `⌈w/28⌉×⌈h/28⌉` (tier-aware downscale), via `visionTokensForModel`. This is
+ *   the exact provider cost — no gate margin — for reporting.
  * - **OpenAI-shaped models**: delegates to the same exact-model router as the
  *   proxy (Grok measured pixel rate; GPT tile/patch rate).
  */
@@ -280,7 +281,7 @@ export interface ExportTokenReport {
  *   imageTokens = estimateImageCount(text, cols) × exportImageTokens(model, stripW, MAX_HEIGHT_PX)
  *   textTokens = sourceText.length / REPORT_CHARS_PER_TOKEN
  *
- * `exportImageTokens` routes to the Anthropic billing formula (width×height/750×1.10)
+ * `exportImageTokens` routes to the Anthropic 28-px patch model (⌈w/28⌉×⌈h/28⌉)
  * for Claude models, and to the GPT tile-pricing formula for GPT/o-series models.
  *
  * `factsheetItemCount` is the number of unique precision-critical identifier strings
@@ -432,7 +433,7 @@ export async function runExportCore(
   });
 
   // Compute token costs using actual rendered image dimensions (more accurate than estimate).
-  // exportImageTokens routes to the Anthropic billing formula for claude-* models and to
+  // exportImageTokens routes to the Anthropic 28-px patch model for claude-* models and to
   // the GPT tile-pricing formula for GPT/o-series models.
   const textTokens = Math.round(sourceText.length / REPORT_CHARS_PER_TOKEN);
   let imageTokens = 0;

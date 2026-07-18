@@ -15,8 +15,9 @@ to re-read that text in token form — Anthropic prompt-caches it, and image
 blocks OCR cleanly at small font sizes. So pxpipe pulls the static prefix
 out of the JSON body, renders it as one or more grayscale PNG image blocks,
 and pins a single `cache_control` breakpoint on the last image. Anthropic
-charges roughly `ceil(W*H/750)` tokens per image; the current Anthropic profile
-caps pages at 1568×728 so rasterized pixels survive the provider's resize. A
+charges `⌈W/28⌉×⌈H/28⌉` visual tokens per image (28-px patches); the current
+Anthropic profile caps pages at 1568×728 (so `56×26 = 1456` tokens) and keeps
+rasterized pixels under the provider's resize. A
 large static slab becomes a small set of image pages on the first turn and a
 cache-read (billed at 0.10×) on subsequent turns. The trade is real text tokens
 for image tokens cached under the same stable prefix.

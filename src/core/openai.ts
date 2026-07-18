@@ -28,11 +28,10 @@ import {
   countVisualRows,
   estimateImageCount,
   sha8,
-  ANTHROPIC_PIXELS_PER_TOKEN,
-  IMAGE_COST_SAFETY_MARGIN,
   type TransformInfo,
   type TransformOptions,
 } from './transform.js';
+import { anthropicVisionTokens } from './anthropic-vision.js';
 import { stripSchemaDescriptions } from './schema-strip.js';
 import {
   planGptCollapse,
@@ -132,7 +131,9 @@ export const GROK_TOKENS_PER_MEGAPIXEL = 1000;
  *  OpenAI tile/patch formula. Model-based, not endpoint-based. */
 export function visionTokensForModel(model: string, w: number, h: number): number {
   if (isClaudeModel(model)) {
-    return Math.ceil((w * h / ANTHROPIC_PIXELS_PER_TOKEN) * IMAGE_COST_SAFETY_MARGIN);
+    // Anthropic's documented 28-px patch model (tier-aware downscale). This is the
+    // exact provider cost; the gate applies its own margin separately.
+    return anthropicVisionTokens(model, w, h);
   }
   if (isGrokModel(model)) {
     const pixels = Math.max(0, w) * Math.max(0, h);

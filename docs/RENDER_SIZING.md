@@ -64,9 +64,9 @@ The profitability gate resolves the same profile as the renderer and derives:
 - per-image token cost
 
 Changing cell spacing or font therefore cannot leave cost prediction on a
-hardcoded 5×8 canvas. Claude uses the Anthropic pixel formula with a conservative
-margin, GPT uses model-specific tile/patch pricing, and Grok uses the measured
-tokens-per-megapixel rate.
+hardcoded 5×8 canvas. Claude uses the Anthropic 28-px patch formula (with a
+conservative margin at the gate), GPT uses model-specific tile/patch pricing, and
+Grok uses the measured tokens-per-megapixel rate.
 
 ## Why not square pages
 

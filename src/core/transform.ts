@@ -41,6 +41,7 @@ import { bytesToBase64 } from './png.js';
 import { collapseHistory, HISTORY_SYNTHETIC_INTRO } from './history.js';
 import type { GptHistoryOptions } from './openai-history.js';
 import { CACHE_CREATE_RATE, CACHE_READ_RATE } from './baseline.js';
+import { patchTokens } from './anthropic-vision.js';
 
 /** Per-block descriptor passed to `TransformOptions.keepSharp`. */
 export interface KeepSharpBlock {
@@ -142,7 +143,7 @@ const DEFAULTS: Required<TransformOptions> = {
   historyAmortizationHorizon: 1,
   priorWarmTokens: 0,
   priorWarmImageTokens: 0,
-  // Multi-col off: single-col slab already holds ~50k chars; extra OCR risk not worth it.
+  // Multi-col off: single-col slab already holds ~28k chars/page at the 1568×728 cap; extra OCR risk not worth it.
   multiCol: 1,
   reflow: true,
   keepSharp: () => false,
@@ -162,11 +163,11 @@ export const CLAUDE_CODE_OAUTH_IDENTITY =
 
 // --- per-block break-even check ---
 //
-// Image token cost is computed from pixel area (Anthropic formula: w×h/750,
-// empirically accurate to ~5% on dense PNGs). Constants bias CONSERVATIVE:
-// CHARS_PER_TOKEN=4 under-estimates text savings; multi-col cost is linearly
-// scaled from single-col + 10% margin. Mispredictions leave money on the
-// table; they never generate net-loss images.
+// Image token cost uses Anthropic's documented 28-px patch model (see
+// src/core/anthropic-vision.ts). Constants bias CONSERVATIVE: CHARS_PER_TOKEN=4
+// under-estimates text savings; the gate multiplies the patch count by
+// ANTHROPIC_GATE_MARGIN on top. Mispredictions leave money on the table; they
+// never generate net-loss images.
 
 /** English ~4 chars per token average (conservative for code/JSON content). */
 const CHARS_PER_TOKEN = 4;
@@ -189,16 +190,11 @@ export const HISTORY_CHARS_PER_TOKEN = 2.0;
  *  of truth — src/core/export.ts imports this rather than redefining it. */
 export const REPORT_CHARS_PER_TOKEN = 3.7;
 
-/** Anthropic image-billing formula: `tokens ≈ width × height / 750`.
- *  https://docs.anthropic.com/en/docs/build-with-claude/vision#image-tokens
- *  Accurate to ~5% on dense glyph PNGs (N=14 empirical calibration). The renderer
- *  sizes height to content, so per-block images cost far less than full-canvas.
- *  Exported so the export pipeline can reuse the same constant rather than hardcoding. */
-export const ANTHROPIC_PIXELS_PER_TOKEN = 750;
-/** Conservative 10% upward bias on Anthropic image token estimates — keeps the gate
- *  on the safe (pass-through) side when the true cost is near the break-even point.
- *  Exported so the export pipeline reuses the same value. */
-export const IMAGE_COST_SAFETY_MARGIN = 1.10;
+/** Gate-only conservatism: a 10% upward bias on the patch-count image estimate,
+ *  keeping the gate on the safe (pass-through) side near break-even. This is NOT
+ *  part of Anthropic's documented cost — the documented per-image formula lives in
+ *  `anthropicVisionTokens` (anthropic-vision.ts); this margin only tunes the gate. */
+export const ANTHROPIC_GATE_MARGIN = 1.10;
 
 /** Width in px of a single-col PNG. Must stay in sync with `renderChunkToPng` (render.ts). */
 function singleColWidthPx(cols: number): number {
@@ -241,8 +237,12 @@ function imageTokensForRows(
   const rowsInLast = Math.min(Math.max(1, linesInLast), rowsPerImage);
   const fullImageHeight = 2 * PAD_Y + rowsPerImage * CELL_H;
   const lastImageHeight = 2 * PAD_Y + rowsInLast * CELL_H;
-  const totalPixels = fullImages * widthPx * fullImageHeight + widthPx * lastImageHeight;
-  return Math.ceil((totalPixels / ANTHROPIC_PIXELS_PER_TOKEN) * IMAGE_COST_SAFETY_MARGIN);
+  // Anthropic bills per-image by 28-px patches (not by summed pixel area), so
+  // count each image separately. pxpipe pages are ≤ 1568×728, so no tier
+  // downscale applies and the raw patch count is tier-agnostic.
+  const patchSum =
+    fullImages * patchTokens(widthPx, fullImageHeight) + patchTokens(widthPx, lastImageHeight);
+  return Math.ceil(patchSum * ANTHROPIC_GATE_MARGIN);
 }
 
 /** Exact image-token cost for `text`. Uses `countVisualRows` and optionally

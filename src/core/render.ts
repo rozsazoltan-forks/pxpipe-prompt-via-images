@@ -1,8 +1,8 @@
 /**
  * Text → PNG renderer. Blits atlas glyphs into a grayscale framebuffer, then PNG-encodes.
  * Iterates by codepoint so East Asian Wide chars (2-cell advance) and surrogate pairs handled correctly.
- * Pages capped at ~1932×1932 px: Fable/Opus 4.8 >20-image requests are held to ≤2000 px/side
- * (REJECTED if exceeded, not silently downscaled); ≤4784 token limit binds first at 1932 px.
+ * Pages capped at 1568×728 px (1.14 MP): under both Anthropic tiers' limits, so every
+ * page bills at its raw 28-px patch count with no server-side downscale (WYSIWYG).
  */
 
 import {
@@ -141,7 +141,8 @@ function grayGlyph(codepoint: number, font: RenderFont | undefined): { atlas: Gr
 
 /** Page-height ceiling. Measured (2026-07-01, count_tokens sweep, claude-sonnet-4-5 — see
  *  /tmp/pxexp/LEVER1-findings.md): the API downscales any image to fit BOTH long-edge ≤1568
- *  AND ~1.15 MP (≈1,143,750 px), then bills ≈ px/750 (≈1525 tok cap, applied per-image).
+ *  AND ~1.15 MP (≈1,143,750 px), then bills the exact 28-px patch count ⌈w/28⌉×⌈h/28⌉
+ *  (1568×728 = 56×26 = 1456 tokens/image; the old ≈px/750 slope was the 28²=784 approximation).
  *  The old 1932×1932 page was billed at cap but resampled 0.555× → 5×8 glyphs reached the
  *  encoder at ~2.8×4.4 px. New page shape 1568×728 = 1,141,504 px fits both bounds →
  *  WYSIWYG for the vision encoder (also satisfies ≤2000 px/side for >20-image requests). */
@@ -1103,7 +1104,7 @@ export async function renderTextToPngs(
 
 const GUTTER_CELLS = 4;
 // Width hard-capped at the API's long-edge bound: anything wider is resampled server-side
-// (measured 2026-07-01: fit-within 1568-edge AND ~1.15 MP, then ≈px/750 billing).
+// (measured 2026-07-01: fit-within 1568-edge AND ~1.15 MP, then 28-px patch billing ⌈w/28⌉×⌈h/28⌉).
 const MAX_WIDTH_PX = 1568;
 
 const GUTTER_DIVIDER_INK = 64; // pre-invert → 191 post-invert: light gray column separator
